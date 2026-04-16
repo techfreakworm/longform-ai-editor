@@ -58,6 +58,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_unify = sub.add_parser("unify", help="Stage D — merge decisions into segments.json")
     p_unify.add_argument("--cursor", type=Path, default=None,
                          help="Cursor CSV for auto-zoom (optional)")
+    p_unify.add_argument("--screen-w", type=int, default=2560,
+                         help="Recorded display width in pixels (for cursor normalization)")
+    p_unify.add_argument("--screen-h", type=int, default=1440,
+                         help="Recorded display height in pixels")
+    p_unify.add_argument("--origin-x", type=float, default=0.0,
+                         help="Recorded display origin X in macOS global coords")
+    p_unify.add_argument("--origin-y", type=float, default=0.0,
+                         help="Recorded display origin Y in macOS global coords")
     _add_common_paths(p_unify)
 
     p_render = sub.add_parser("render", help="Stage E — ffmpeg render")

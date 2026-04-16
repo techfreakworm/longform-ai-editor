@@ -1,105 +1,454 @@
 """Stage D — merge all decisions into the canonical segments.json.
 
 Consumes:
-  work/layout_plan.json    (the backbone — covers entire duration)
-  work/filler_cuts.json    (intervals to remove)
-  work/dead_zones.json     (intervals to cut or speed-ramp)
-  cursor.csv (optional)    (for cursor_zoom annotations)
+  work/layout_plan.json    (backbone — covers entire duration)
+  work/filler_cuts.json    (intervals to remove entirely)
+  work/dead_zones.json     (intervals to cut OR speed-ramp)
+  cursor.csv  (optional)   (raw cursor log — zoom segments generated here)
+  work/sync.json (optional) (carries csv_to_video_offset_s)
 
 Emits:
-  work/segments.json — [{in, out, speed, layout, cursor_zoom?}, ...]
-  covering the entire final timeline with no gaps or overlaps.
+  work/segments.json — the canonical edit list. Every entry has
+    {"start", "end", "speed", "layout", "cursor_zooms"} where start / end
+    are in ORIGINAL video (OBS) timebase. The render stage trims from
+    the raw source at these times and concatenates.
 
-Algorithm (in order — order matters!):
-  1. Start with layout_plan as the backbone.
-  2. Ripple-remove every filler_cuts entry.
-  3. For each dead_zone:
-       action=cut     → ripple-remove
-       action=speed@N → keep, set speed=N on that portion
-  4. Merge adjacent same-(layout,speed) segments.
-  5. If cursor.csv present, annotate screen-visible segments with zoom windows
-     from cursor_zoom.generate_zoom_segments().
-  6. Validate: no gaps, no overlaps, every field present.
+Algorithm (order matters):
+  1. Load layout_plan as the backbone (covers [0, source_duration]).
+     Merge adjacent same-layout segments (cleans up LLM output).
+  2. For every filler_cuts entry, SUBTRACT from the timeline. Splits
+     the overlapping segment(s) into two — the gap is not rendered.
+  3. For every dead_zone:
+       action == "cut"      → subtract like a filler.
+       action == "speed@Nx" → split at boundaries, mark inner pieces
+                              with speed = N.
+  4. If cursor.csv + sync.json provided, generate zoom segments (via
+     cursor_zoom.generate_zoom_segments), shift from CSV time to video
+     time using csv_to_video_offset_s, then attach to screen-visible
+     segments (pip / screen_full) clipped to segment bounds.
+  5. Validate: no overlapping segments, every field present, every
+     segment's start < end, all segments within [0, source_duration].
 
-TODO(M4): implement. See IMPLEMENTATION_PLAN.md §M4.
+Timestamp convention:
+  - segment.start / segment.end: absolute original-video seconds
+  - cursor_zooms[i].start / .end: absolute original-video seconds, and
+    always satisfy segment.start ≤ zoom.start < zoom.end ≤ segment.end
 """
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
+import json
+import logging
+import sys
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from src import config
+from src.stages.cursor_zoom import ZoomSegment, generate_zoom_segments
+
+log = logging.getLogger(__name__)
+
 
 Layout = Literal["cam_full", "pip", "screen_full"]
+SCREEN_VISIBLE_LAYOUTS: frozenset[str] = frozenset({"pip", "screen_full"})
+
+# How closely two floats must agree to be "equal" for timeline ops.
+EPS = 1e-6
 
 
 @dataclass
 class ZoomWindow:
-    start: float  # relative to segment start
+    start: float
     end: float
     zoom: float
-    cx: float  # 0–1 normalized
+    cx: float  # normalized [0,1]
     cy: float
 
 
 @dataclass
 class Segment:
-    in_: float
-    out: float
+    start: float
+    end: float
     speed: float = 1.0
     layout: Layout = "pip"
-    cursor_zoom: list[ZoomWindow] = field(default_factory=list)
+    cursor_zooms: list[ZoomWindow] = field(default_factory=list)
+
+    @property
+    def duration(self) -> float:
+        return self.end - self.start
+
+    def to_dict(self) -> dict:
+        return {
+            "start": self.start,
+            "end": self.end,
+            "speed": self.speed,
+            "layout": self.layout,
+            "cursor_zooms": [asdict(z) for z in self.cursor_zooms],
+        }
 
 
-def apply_cuts(timeline: list[Segment], cuts: list[tuple[float, float]]) -> list[Segment]:
-    """Ripple-delete each (start, end) interval from the timeline.
-    TODO(M4).
+# ---------- loaders ---------------------------------------------------
+
+def load_layout_plan(path: Path) -> list[Segment]:
+    """Load layout_plan.json and pre-merge adjacent same-layout entries.
+
+    Expected shape: {"segments": [{"start", "end", "layout"}, ...]}
     """
-    raise NotImplementedError
+    data = json.loads(path.read_text())
+    raw = data.get("segments", [])
+    if not raw:
+        raise ValueError(f"{path} has no segments")
+    tl = [
+        Segment(start=float(s["start"]), end=float(s["end"]), layout=s["layout"])
+        for s in raw
+    ]
+    tl.sort(key=lambda s: s.start)
+    return merge_adjacent(tl)
 
 
-def apply_dead_zones(timeline: list[Segment], dead_zones) -> list[Segment]:
-    """Apply dead-zone actions (cut or speed-ramp) to the timeline.
-    TODO(M4).
-    """
-    raise NotImplementedError
+def load_cuts(path: Path, key: str = "cuts") -> list[tuple[float, float]]:
+    """Load filler_cuts.json or similar. Returns list of (start, end)."""
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text())
+    entries = data.get(key, [])
+    return [(float(e["start"]), float(e["end"])) for e in entries]
 
+
+def load_dead_zones(path: Path) -> list[tuple[float, float, str]]:
+    """Load dead_zones.json. Returns list of (start, end, action)."""
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text())
+    zones = data.get("zones", []) or data.get("dead_zones", [])
+    return [(float(z["start"]), float(z["end"]), z["action"]) for z in zones]
+
+
+# ---------- core operations -------------------------------------------
 
 def merge_adjacent(timeline: list[Segment]) -> list[Segment]:
-    """Merge same-(layout,speed) neighbors.
-    TODO(M4).
+    """Merge consecutive segments that:
+      - share a boundary (prev.end ≈ next.start, i.e. contiguous), AND
+      - share the same (layout, speed) pair.
     """
-    raise NotImplementedError
+    if not timeline:
+        return []
+    out: list[Segment] = [
+        Segment(
+            start=timeline[0].start,
+            end=timeline[0].end,
+            speed=timeline[0].speed,
+            layout=timeline[0].layout,
+            cursor_zooms=list(timeline[0].cursor_zooms),
+        )
+    ]
+    for seg in timeline[1:]:
+        prev = out[-1]
+        contiguous = abs(seg.start - prev.end) < EPS
+        same_kind = seg.layout == prev.layout and abs(seg.speed - prev.speed) < EPS
+        if contiguous and same_kind:
+            prev.end = seg.end
+            prev.cursor_zooms.extend(seg.cursor_zooms)
+        else:
+            out.append(Segment(
+                start=seg.start, end=seg.end, speed=seg.speed,
+                layout=seg.layout, cursor_zooms=list(seg.cursor_zooms),
+            ))
+    return out
 
 
-def annotate_cursor_zooms(timeline: list[Segment], cursor_csv: Path) -> list[Segment]:
-    """Attach cursor-zoom windows to segments showing the screen.
-    TODO(M4).
+def subtract_range(
+    timeline: list[Segment], cut_start: float, cut_end: float
+) -> list[Segment]:
+    """Remove [cut_start, cut_end) from every overlapping segment.
+
+    A segment fully inside the cut is deleted. A segment straddling either
+    edge is shortened. A segment fully containing the cut is split into
+    two sub-segments with matching (speed, layout, cursor_zooms cloned).
     """
-    raise NotImplementedError
+    if cut_end <= cut_start:
+        return timeline
+    out: list[Segment] = []
+    for seg in timeline:
+        # No overlap
+        if seg.end <= cut_start + EPS or seg.start >= cut_end - EPS:
+            out.append(seg)
+            continue
+        # Fully swallowed by cut
+        if cut_start - EPS <= seg.start and seg.end <= cut_end + EPS:
+            continue
+        # Left remainder
+        if seg.start < cut_start - EPS:
+            out.append(Segment(
+                start=seg.start, end=cut_start, speed=seg.speed,
+                layout=seg.layout,
+                cursor_zooms=_clip_zooms(seg.cursor_zooms, seg.start, cut_start),
+            ))
+        # Right remainder
+        if seg.end > cut_end + EPS:
+            out.append(Segment(
+                start=cut_end, end=seg.end, speed=seg.speed,
+                layout=seg.layout,
+                cursor_zooms=_clip_zooms(seg.cursor_zooms, cut_end, seg.end),
+            ))
+    return out
 
 
-def validate(timeline: list[Segment], total_duration: float, tol: float = 1e-3) -> None:
-    """Assert no gaps, no overlaps, all fields set.
-    TODO(M4): raise ValueError with diagnostic on failure.
+def apply_cuts(
+    timeline: list[Segment], cuts: list[tuple[float, float]]
+) -> list[Segment]:
+    """Apply a list of (start, end) cuts in order."""
+    tl = list(timeline)
+    for s, e in cuts:
+        tl = subtract_range(tl, s, e)
+    return tl
+
+
+def _parse_speed_action(action: str) -> float | None:
+    """'speed@4x' → 4.0; 'speed@8x' → 8.0; 'cut' → None; other → None."""
+    if not action.startswith("speed@"):
+        return None
+    tail = action[len("speed@"):]
+    if tail.endswith("x"):
+        tail = tail[:-1]
+    try:
+        return float(tail)
+    except ValueError:
+        return None
+
+
+def apply_dead_zones(
+    timeline: list[Segment], dead_zones: list[tuple[float, float, str]]
+) -> list[Segment]:
+    """For each dead zone: if action=='cut', subtract. Else speed-ramp."""
+    tl = list(timeline)
+    for start, end, action in dead_zones:
+        if action == "cut":
+            tl = subtract_range(tl, start, end)
+        else:
+            speed = _parse_speed_action(action)
+            if speed is None or speed <= 0.0:
+                log.warning("unknown dead_zone action %r, skipping", action)
+                continue
+            tl = _apply_speed_ramp(tl, start, end, speed)
+    return tl
+
+
+def _apply_speed_ramp(
+    timeline: list[Segment], start: float, end: float, speed: float
+) -> list[Segment]:
+    """Split segments at [start, end); tag the interior pieces with the
+    given speed. Outside pieces keep their existing speed.
     """
-    raise NotImplementedError
+    if end <= start:
+        return timeline
+    out: list[Segment] = []
+    for seg in timeline:
+        if seg.end <= start + EPS or seg.start >= end - EPS:
+            out.append(seg)
+            continue
+        # Left remainder
+        if seg.start < start - EPS:
+            out.append(Segment(
+                start=seg.start, end=start, speed=seg.speed, layout=seg.layout,
+                cursor_zooms=_clip_zooms(seg.cursor_zooms, seg.start, start),
+            ))
+        # Interior with new speed (intersect [start,end) and seg)
+        i_start = max(seg.start, start)
+        i_end = min(seg.end, end)
+        if i_end > i_start + EPS:
+            out.append(Segment(
+                start=i_start, end=i_end, speed=speed, layout=seg.layout,
+                cursor_zooms=_clip_zooms(seg.cursor_zooms, i_start, i_end),
+            ))
+        # Right remainder
+        if seg.end > end + EPS:
+            out.append(Segment(
+                start=end, end=seg.end, speed=seg.speed, layout=seg.layout,
+                cursor_zooms=_clip_zooms(seg.cursor_zooms, end, seg.end),
+            ))
+    return out
 
+
+def _clip_zooms(
+    zooms: list[ZoomWindow], lo: float, hi: float
+) -> list[ZoomWindow]:
+    """Keep only zooms overlapping [lo, hi); clip their bounds."""
+    out: list[ZoomWindow] = []
+    for z in zooms:
+        if z.end <= lo + EPS or z.start >= hi - EPS:
+            continue
+        out.append(ZoomWindow(
+            start=max(z.start, lo),
+            end=min(z.end, hi),
+            zoom=z.zoom, cx=z.cx, cy=z.cy,
+        ))
+    return out
+
+
+def annotate_cursor_zooms(
+    timeline: list[Segment], zoom_segments: list[ZoomSegment], csv_to_video_offset_s: float
+) -> list[Segment]:
+    """Attach zoom windows to screen-visible segments.
+
+    Zoom segments come from cursor_zoom.py in CSV timebase; shift them to
+    video time via csv_to_video_offset_s. Clip to each segment's bounds.
+    Skip segments whose layout does not show the screen (cam_full).
+    """
+    # Shift once into video timebase
+    shifted = [
+        ZoomWindow(
+            start=z.start + csv_to_video_offset_s,
+            end=z.end + csv_to_video_offset_s,
+            zoom=z.zoom, cx=z.cx, cy=z.cy,
+        )
+        for z in zoom_segments
+    ]
+    out: list[Segment] = []
+    for seg in timeline:
+        if seg.layout not in SCREEN_VISIBLE_LAYOUTS:
+            # Screen not visible — no zoom makes sense.
+            out.append(Segment(
+                start=seg.start, end=seg.end, speed=seg.speed,
+                layout=seg.layout, cursor_zooms=[],
+            ))
+            continue
+        attached = _clip_zooms(shifted, seg.start, seg.end)
+        out.append(Segment(
+            start=seg.start, end=seg.end, speed=seg.speed,
+            layout=seg.layout, cursor_zooms=attached,
+        ))
+    return out
+
+
+# ---------- validation ------------------------------------------------
+
+def validate(
+    timeline: list[Segment], source_duration: float, tol: float = 1e-3
+) -> None:
+    """Raise ValueError with a clear diagnostic if the timeline is malformed.
+
+    Checks:
+      - every segment: start < end
+      - every segment within [0, source_duration]
+      - no overlaps between adjacent sorted segments
+      - every field has a valid value
+      - cursor_zooms inside their segment's bounds
+    """
+    if not timeline:
+        raise ValueError("empty timeline")
+    srt = sorted(timeline, key=lambda s: s.start)
+    prev_end = -float("inf")
+    for i, seg in enumerate(srt):
+        if seg.end <= seg.start:
+            raise ValueError(f"segment #{i} has end ≤ start: {seg}")
+        if seg.start < -tol:
+            raise ValueError(f"segment #{i} starts before 0: {seg}")
+        if seg.end > source_duration + tol:
+            raise ValueError(
+                f"segment #{i} ends after source_duration "
+                f"({seg.end} > {source_duration}): {seg}"
+            )
+        if seg.speed <= 0.0:
+            raise ValueError(f"segment #{i} has non-positive speed: {seg}")
+        if seg.layout not in ("cam_full", "pip", "screen_full"):
+            raise ValueError(f"segment #{i} has unknown layout: {seg}")
+        if seg.start + tol < prev_end:
+            raise ValueError(
+                f"segments overlap: #{i-1} ends {prev_end}, "
+                f"#{i} starts {seg.start}"
+            )
+        prev_end = seg.end
+        for j, z in enumerate(seg.cursor_zooms):
+            if not (seg.start - tol <= z.start < z.end <= seg.end + tol):
+                raise ValueError(
+                    f"segment #{i} zoom #{j} outside segment bounds: "
+                    f"seg=[{seg.start},{seg.end}], zoom=[{z.start},{z.end}]"
+                )
+
+
+# ---------- CLI entry -------------------------------------------------
 
 def run(args: argparse.Namespace) -> int:
-    raise NotImplementedError(
-        "unify_segments.run — see IMPLEMENTATION_PLAN.md §M4"
-    )
+    work_dir: Path = Path(args.work) if getattr(args, "work", None) else config.WORK_DIR
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    layout_path = work_dir / "layout_plan.json"
+    filler_path = work_dir / "filler_cuts.json"
+    dead_path = work_dir / "dead_zones.json"
+    sync_path = work_dir / "sync.json"
+    segments_path = work_dir / "segments.json"
+
+    try:
+        timeline = load_layout_plan(layout_path)
+        source_duration = timeline[-1].end
+
+        filler_cuts = load_cuts(filler_path, key="cuts")
+        timeline = apply_cuts(timeline, filler_cuts)
+        timeline = merge_adjacent(timeline)
+
+        dead_zones = load_dead_zones(dead_path)
+        timeline = apply_dead_zones(timeline, dead_zones)
+        timeline = merge_adjacent(timeline)
+
+        # Optional cursor zoom
+        cursor_csv: Path | None = getattr(args, "cursor", None)
+        if cursor_csv is not None and cursor_csv.exists() and sync_path.exists():
+            sync_data = json.loads(sync_path.read_text())
+            offset = sync_data.get("csv_to_video_offset_s")
+            if offset is None:
+                log.warning(
+                    "sync.json has no csv_to_video_offset_s; "
+                    "skipping cursor_zoom annotations"
+                )
+            else:
+                # Screen dimensions + origin come from config or flags.
+                screen_w = int(getattr(args, "screen_w", 2560))
+                screen_h = int(getattr(args, "screen_h", 1440))
+                origin_x = float(getattr(args, "origin_x", 0.0))
+                origin_y = float(getattr(args, "origin_y", 0.0))
+                zooms = generate_zoom_segments(
+                    cursor_csv, screen_w=screen_w, screen_h=screen_h,
+                    duration_s=source_duration,
+                    origin_x=origin_x, origin_y=origin_y,
+                )
+                timeline = annotate_cursor_zooms(timeline, zooms, offset)
+
+        validate(timeline, source_duration)
+
+        doc = {
+            "source_duration_s": source_duration,
+            "segments": [s.to_dict() for s in timeline],
+        }
+        segments_path.write_text(json.dumps(doc, indent=2))
+
+        total = sum(s.duration for s in timeline)
+        cut_total = source_duration - total
+        print(
+            f"[unify] {len(timeline)} segments; "
+            f"final duration {total:.2f}s "
+            f"(source {source_duration:.2f}s, cut {cut_total:.2f}s)"
+        )
+        print(f"[unify] wrote {segments_path}")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"[unify] ERROR: {exc}", file=sys.stderr)
+        return 1
 
 
 __all__ = [
     "Layout",
+    "SCREEN_VISIBLE_LAYOUTS",
     "ZoomWindow",
     "Segment",
+    "load_layout_plan",
+    "load_cuts",
+    "load_dead_zones",
+    "merge_adjacent",
+    "subtract_range",
     "apply_cuts",
     "apply_dead_zones",
-    "merge_adjacent",
     "annotate_cursor_zooms",
     "validate",
     "run",
