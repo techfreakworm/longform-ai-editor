@@ -1,0 +1,35 @@
+# Venvs
+venv/
+cursor-tracker/venv/
+.venv/
+
+# Config
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Work outputs (stage artifacts, rendered videos)
+work/
+output/
+*.mp4
+*.mkv
+*.wav
+*.mp3
+
+# Test fixtures EXCLUDED from gitignore — we want them tracked.
+# Uncomment the next line if you prefer LFS or out-of-band fixtures:
+# tests/fixtures/*.mkv
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp

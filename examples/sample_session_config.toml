@@ -1,0 +1,22 @@
+# Example per-session config override — optional; falls back to .env / config.py defaults.
+# Usage:
+#   python -m src.cli run --config examples/sample_session_config.toml ...
+#
+# NOTE: not yet wired — planned for M6+. Until then, use .env.
+
+[detection]
+# These creators talk fast + type quiet → tighter silence threshold
+silence_db = -25.0
+silence_min_sec = 1.8
+
+# Running render previews on screen → raise motion threshold so render
+# doesn't get flagged as active during waits
+motion_threshold = 0.04
+
+[render]
+bitrate = "15M"   # higher than default for code-screen content
+fps = 30
+
+[loudness]
+# Optimized for YouTube; TikTok uses -12 LUFS if you also publish there
+target = -14.0
