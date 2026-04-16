@@ -91,7 +91,24 @@ Seven milestones, M0 through M6. Each milestone has:
 
 Estimate 1–3 evenings per milestone on M5 Max.
 
-### M0 — Skeleton + environment verified
+### Status as of last commit
+
+| Milestone | Status | Tests |
+|---|---|---|
+| M0 — scaffold | ✅ done | — |
+| M0b — cursor tracker | ✅ done | — |
+| M1 — Stage A (sync) | ✅ done | 18 |
+| cursor_zoom (Cap port) | ✅ done | 22 |
+| M2 — Stage B (transcribe + LLM) | ✅ done | 32 |
+| M3 — Stage C (dead-zone detect) | ✅ done | 32 |
+| M4 — Stage D (unify segments) | ✅ done | 46 |
+| M5 — Stage E (render) | ✅ done | 30 |
+| **M6 — Stage F (polish + integration)** | 🔴 TODO | — |
+
+End-to-end verified against real OBS fixtures: 95.75 s source →
+42.99 s 1920×1080 HEVC 60fps in 7.6 s render wall-clock.
+
+### M0 — Skeleton + environment verified  ✅ DONE
 
 **DoD.** `scripts/install.sh` runs to completion. `scripts/verify_env.py` passes. Empty `python -m src.cli --help` prints usage. Cursor tracker works (see M0b).
 
@@ -109,7 +126,7 @@ Estimate 1–3 evenings per milestone on M5 Max.
 - `obs-source-record` plugin installs outside pip — script downloads the `.pkg` but user must run it manually (macOS Gatekeeper).
 - `hf auth login` needs interactive token entry — script detects if already authed and skips.
 
-### M0b — Cursor tracker (parallel, usable immediately)
+### M0b — Cursor tracker (parallel, usable immediately)  ✅ DONE
 
 **DoD.** Run `cursor-tracker/record.sh` and it logs moves/clicks to CSV. Hotkey ⌃⌥⌘K flashes screen + marks CSV with `event=clap`.
 
@@ -129,7 +146,7 @@ Estimate 1–3 evenings per milestone on M5 Max.
 
 This milestone can ship independently of M1–M6 so you can start recording with the tracker immediately.
 
-### M1 — Stage A: sync working end-to-end
+### M1 — Stage A: sync working end-to-end  ✅ DONE
 
 **DoD.** Given two raw mkv inputs with a recorded clap cue, `python -m src.cli sync --screen <path> --webcam <path>` emits `offset.json` and trimmed `screen_synced.mkv` + `webcam_synced.mkv` that align to within ±1 frame @ 60 fps.
 
@@ -146,7 +163,7 @@ This milestone can ship independently of M1–M6 so you can start recording with
 - When `offset < 0`, screen started after webcam — trim screen instead of webcam. Handle both signs.
 - Fall back to manual offset entry via `--manual-offset 0.163` flag if auto-detection fails.
 
-### M2 — Stage B: transcribe + analyze
+### M2 — Stage B: transcribe + analyze  ✅ DONE
 
 **DoD.** `python -m src.cli analyze --webcam webcam_synced.mkv` emits:
 - `words.json` (mlx-whisper output with word timestamps)
@@ -167,7 +184,7 @@ This milestone can ship independently of M1–M6 so you can start recording with
 - Qwen3's thinking mode can inject `<think>...</think>` tags into the output. Strip before json.loads.
 - Layout plan must cover entire duration — if LLM returns gaps, post-process to fill with previous segment's layout.
 
-### M3 — Stage C: dead-zone detect
+### M3 — Stage C: dead-zone detect  ✅ DONE
 
 **DoD.** `python -m src.cli detect-dead --screen screen_synced.mkv --webcam webcam_synced.mkv --words words.json` emits `dead_zones.json = [{start, end, action ∈ {cut, speed@4x, speed@8x}}, ...]`.
 
@@ -196,7 +213,7 @@ This milestone can ship independently of M1–M6 so you can start recording with
 - `auto-editor --export premiere` emits FCP7 XML; parse with ElementTree, extract `<clipitem><start>` values.
 - Expect 10–20% false positives on first sessions. Add a `--tune` mode that surfaces candidates for human review.
 
-### M4 — Stage D: unify segments
+### M4 — Stage D: unify segments  ✅ DONE
 
 **DoD.** `python -m src.cli unify` consumes all Stage B+C outputs and emits `segments.json` — a complete edit list covering every second of the final timeline with resolved `(in, out, speed, layout, cursor_zoom?)` tuples.
 
@@ -221,7 +238,7 @@ This milestone can ship independently of M1–M6 so you can start recording with
 - Float arithmetic on timestamps drifts — use `Decimal` or round to millisecond before comparing.
 - The golden test needs to survive small floating-point differences — use `assertAlmostEqual` with 3 decimal places for times.
 
-### M5 — Stage E: render
+### M5 — Stage E: render  ✅ DONE
 
 **DoD.** `python -m src.cli render --segments segments.json` invokes a single `ffmpeg` call that produces `composed.mp4` — 1080p HEVC with all cuts, speed ramps, layout switches, and cursor zooms applied.
 
@@ -263,7 +280,7 @@ This milestone can ship independently of M1–M6 so you can start recording with
 - VideoToolbox encoder doesn't like some pixel formats — force `format=yuv420p` on the final chain.
 - For cursor zoom, use pre-segment `crop` with `scale` to 1080p rather than per-frame expressions — simpler and faster.
 
-### M6 — Stage F: polish + integration test
+### M6 — Stage F: polish + integration test  🔴 TODO
 
 **DoD.** `python -m src.cli run --screen raw_screen.mkv --webcam raw_webcam.mkv` runs the full pipeline end-to-end. Output `final.mp4` is -14 LUFS compliant (verified via `ffmpeg-normalize --print-stats`).
 

@@ -94,11 +94,28 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_paths(p_polish)
 
     p_run = sub.add_parser("run", help="Run all stages end-to-end")
-    p_run.add_argument("--screen", type=Path, required=True)
-    p_run.add_argument("--webcam", type=Path, required=True)
-    p_run.add_argument("--cursor", type=Path, default=None)
-    p_run.add_argument("--output", type=Path, required=True)
-    p_run.add_argument("--skip-denoise", action="store_true")
+    p_run.add_argument("--screen", type=Path, required=True,
+                       help="Screen recording (e.g. ext.mov from OBS source-record)")
+    p_run.add_argument("--webcam", type=Path, required=True,
+                       help="Webcam recording (e.g. cam.mov from OBS source-record)")
+    p_run.add_argument("--audio", type=Path, default=None,
+                       help="Audio source (defaults to --webcam's audio; use merged.mp4 for cleaner mix)")
+    p_run.add_argument("--cursor", type=Path, default=None,
+                       help="cursor.csv from cursor-tracker (enables auto-zoom)")
+    p_run.add_argument("--output", type=Path, required=True,
+                       help="Final .mp4 path")
+    p_run.add_argument("--manual-offset", type=float, default=None,
+                       help="Skip Stage A auto-sync and use this CSV offset (seconds)")
+    p_run.add_argument("--screen-w", type=int, default=2560,
+                       help="Recorded display width in pixels (cursor-zoom normalization)")
+    p_run.add_argument("--screen-h", type=int, default=1440,
+                       help="Recorded display height")
+    p_run.add_argument("--origin-x", type=float, default=0.0,
+                       help="Recorded display origin X in macOS global coords")
+    p_run.add_argument("--origin-y", type=float, default=0.0,
+                       help="Recorded display origin Y in macOS global coords")
+    p_run.add_argument("--skip-denoise", action="store_true",
+                       help="Skip M6 denoise stage (currently always skipped until M6 lands)")
     _add_common_paths(p_run)
 
     sub.add_parser("verify", help="Environment sanity check")
