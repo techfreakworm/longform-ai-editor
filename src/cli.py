@@ -47,6 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_analyze = sub.add_parser("analyze", help="Stage B — transcribe + LLM")
     p_analyze.add_argument("--webcam", type=Path, required=True,
                            help="Synced webcam from Stage A")
+    p_analyze.add_argument("--audio", type=Path, default=None,
+                           help="Override audio source (default: --webcam)")
     _add_common_paths(p_analyze)
 
     p_dead = sub.add_parser("detect-dead", help="Stage C — screen dead-zone detect")

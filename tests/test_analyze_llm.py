@@ -1,0 +1,298 @@
+"""Tests for Stage B.2 — LLM-driven filler + layout analysis.
+
+Unit tests mock httpx to avoid the running LLM server. @slow integration
+tests hit the real server if it's reachable.
+"""
+from __future__ import annotations
+
+import json
+from unittest.mock import MagicMock, patch
+
+import httpx
+import pytest
+
+from src.stages.analyze_llm import (
+    FillerCut,
+    FillerCutsResponse,
+    LayoutPlanResponse,
+    LayoutSegment,
+    _extract_json_body,
+    _fill_coverage_gaps,
+    analyze_fillers,
+    analyze_layout,
+    call_llm_json,
+    strip_thinking,
+)
+
+
+# --- strip_thinking -----------------------------------------------------
+
+def test_strip_thinking_removes_tags() -> None:
+    assert strip_thinking("<think>internal</think>hello") == "hello"
+
+
+def test_strip_thinking_multiline() -> None:
+    txt = "pre\n<think>\nmulti\nline\n</think>\npost"
+    assert strip_thinking(txt) == "pre\n\npost"
+
+
+def test_strip_thinking_no_tags_passthrough() -> None:
+    assert strip_thinking("plain text") == "plain text"
+
+
+# --- _extract_json_body ------------------------------------------------
+
+def test_extract_json_body_plain() -> None:
+    assert _extract_json_body('{"a": 1}') == '{"a": 1}'
+
+
+def test_extract_json_body_with_markdown_fence() -> None:
+    text = '```json\n{"cuts": []}\n```'
+    assert _extract_json_body(text) == '{"cuts": []}'
+
+
+def test_extract_json_body_with_preamble() -> None:
+    text = 'Sure, here is the JSON:\n{"x": 42}\nEnd.'
+    assert _extract_json_body(text) == '{"x": 42}'
+
+
+def test_extract_json_body_nested_braces() -> None:
+    text = '{"outer": {"inner": 1}}'
+    assert _extract_json_body(text) == text
+
+
+def test_extract_json_body_no_json_raises() -> None:
+    with pytest.raises(ValueError, match="no JSON"):
+        _extract_json_body("just prose, no JSON here")
+
+
+def test_extract_json_body_unbalanced_raises() -> None:
+    with pytest.raises(ValueError, match="unbalanced"):
+        _extract_json_body('{"oops": "never closed"')
+
+
+# --- _fill_coverage_gaps ------------------------------------------------
+
+def _L(start, end, layout):
+    return LayoutSegment(start=start, end=end, layout=layout)
+
+
+def test_fill_coverage_no_gap_no_change() -> None:
+    segs = [_L(0, 10, "cam_full"), _L(10, 30, "pip")]
+    out = _fill_coverage_gaps(segs, 30.0)
+    assert [(s.start, s.end, s.layout) for s in out] == [
+        (0, 10, "cam_full"), (10, 30, "pip"),
+    ]
+
+
+def test_fill_coverage_leading_gap_inserts_default() -> None:
+    segs = [_L(5, 15, "pip")]
+    out = _fill_coverage_gaps(segs, 15.0, default_layout="pip")
+    assert [(s.start, s.end, s.layout) for s in out] == [
+        (0, 5, "pip"), (5, 15, "pip"),
+    ]
+
+
+def test_fill_coverage_middle_gap_extends_prev() -> None:
+    """Gap between 10 and 15 is filled by extending the first segment."""
+    segs = [_L(0, 10, "cam_full"), _L(15, 30, "pip")]
+    out = _fill_coverage_gaps(segs, 30.0)
+    assert out[0].end == 15  # extended
+    assert out[0].layout == "cam_full"
+    assert out[1].start == 15
+
+
+def test_fill_coverage_trailing_gap_extends_last() -> None:
+    segs = [_L(0, 20, "pip")]
+    out = _fill_coverage_gaps(segs, 30.0)
+    assert out[-1].end == 30
+    assert out[-1].layout == "pip"
+
+
+def test_fill_coverage_overlap_truncates_later() -> None:
+    segs = [_L(0, 20, "pip"), _L(15, 30, "cam_full")]
+    out = _fill_coverage_gaps(segs, 30.0)
+    assert out[0].end == 20
+    assert out[1].start == 20  # truncated
+    assert out[1].end == 30
+
+
+def test_fill_coverage_empty_input_single_default() -> None:
+    out = _fill_coverage_gaps([], 30.0, default_layout="cam_full")
+    assert len(out) == 1
+    assert (out[0].start, out[0].end, out[0].layout) == (0, 30, "cam_full")
+
+
+def test_fill_coverage_segment_fully_inside_other_dropped() -> None:
+    segs = [_L(0, 30, "pip"), _L(5, 10, "cam_full")]
+    out = _fill_coverage_gaps(segs, 30.0)
+    # The inner cam_full is fully inside the outer pip — dropped
+    assert len(out) == 1
+    assert out[0].layout == "pip"
+
+
+# --- call_llm_json (mocked http) -------------------------------------
+
+def _mock_httpx_response(content_json: dict) -> MagicMock:
+    m = MagicMock(spec=httpx.Response)
+    m.status_code = 200
+    m.raise_for_status = MagicMock()
+    m.json.return_value = {
+        "choices": [
+            {"message": {"content": json.dumps(content_json)}}
+        ],
+    }
+    return m
+
+
+def test_call_llm_json_returns_parsed_body() -> None:
+    with patch("src.stages.analyze_llm.httpx.post",
+               return_value=_mock_httpx_response({"result": 42})):
+        out = call_llm_json("sys prompt", {"user": "payload"})
+    assert out == {"result": 42}
+
+
+def test_call_llm_json_strips_think_tags() -> None:
+    content = "<think>noisy reasoning</think>{\"result\": 1}"
+    m = MagicMock(spec=httpx.Response)
+    m.status_code = 200
+    m.raise_for_status = MagicMock()
+    m.json.return_value = {"choices": [{"message": {"content": content}}]}
+    with patch("src.stages.analyze_llm.httpx.post", return_value=m):
+        out = call_llm_json("sys", {})
+    assert out == {"result": 1}
+
+
+# --- analyze_fillers (mocked) ----------------------------------------
+
+def test_analyze_fillers_parses_valid_response() -> None:
+    payload = {
+        "cuts": [
+            {"start": 5.4, "end": 5.8, "reason": "filler"},
+            {"start": 12.1, "end": 12.6, "reason": "false_start"},
+        ],
+    }
+    with patch("src.stages.analyze_llm.httpx.post",
+               return_value=_mock_httpx_response(payload)):
+        out = analyze_fillers([{"word": "um", "start": 5.4, "end": 5.8}])
+    assert isinstance(out, FillerCutsResponse)
+    assert len(out.cuts) == 2
+    assert out.cuts[0].reason == "filler"
+
+
+def test_analyze_fillers_empty_cuts_is_valid() -> None:
+    with patch("src.stages.analyze_llm.httpx.post",
+               return_value=_mock_httpx_response({"cuts": []})):
+        out = analyze_fillers([])
+    assert out.cuts == []
+
+
+def test_analyze_fillers_retries_on_bad_schema() -> None:
+    """A genuinely invalid response triggers tenacity retry — `cuts` must
+    be a list, passing a string fails pydantic and forces a second call.
+    """
+    bad = _mock_httpx_response({"cuts": "not a list"})
+    good = _mock_httpx_response({"cuts": [{"start": 1.0, "end": 2.0}]})
+    with patch("src.stages.analyze_llm.httpx.post",
+               side_effect=[bad, good]) as m:
+        out = analyze_fillers([])
+    assert m.call_count == 2
+    assert len(out.cuts) == 1
+
+
+# --- analyze_layout (mocked) -----------------------------------------
+
+def test_analyze_layout_post_fills_gaps() -> None:
+    """LLM returns a plan with gaps; post-processor fills them to full coverage."""
+    payload = {
+        "segments": [
+            {"start": 0, "end": 10, "layout": "cam_full"},
+            {"start": 15, "end": 30, "layout": "pip"},  # 5 s gap
+        ],
+    }
+    with patch("src.stages.analyze_llm.httpx.post",
+               return_value=_mock_httpx_response(payload)):
+        out = analyze_layout([], total_duration=30.0)
+    # Total coverage must equal 30 s, no gaps
+    total = sum(s.end - s.start for s in out.segments)
+    assert abs(total - 30.0) < 1e-6
+    # No overlaps
+    for a, b in zip(out.segments, out.segments[1:]):
+        assert b.start >= a.end - 1e-6
+
+
+def test_analyze_layout_rejects_bad_layout() -> None:
+    payload = {"segments": [{"start": 0, "end": 10, "layout": "bogus"}]}
+    good = _mock_httpx_response({
+        "segments": [{"start": 0, "end": 10, "layout": "pip"}],
+    })
+    with patch("src.stages.analyze_llm.httpx.post",
+               side_effect=[_mock_httpx_response(payload), good]) as m:
+        out = analyze_layout([], total_duration=10.0)
+    assert m.call_count == 2
+    assert out.segments[0].layout == "pip"
+
+
+# --- INTEGRATION (real server) ---------------------------------------
+
+def _server_reachable() -> bool:
+    try:
+        r = httpx.get("http://127.0.0.1:8080/v1/models", timeout=3)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+@pytest.mark.slow
+def test_analyze_fillers_against_real_llm() -> None:
+    """End-to-end with the actual running LLM. Skipped if server is down."""
+    if not _server_reachable():
+        pytest.skip("LLM server not running at http://127.0.0.1:8080/v1")
+    # A synthetic transcript with some obvious fillers
+    words = [
+        {"word": "So", "start": 0.0, "end": 0.3, "probability": 0.99},
+        {"word": "um", "start": 0.4, "end": 0.7, "probability": 0.95},
+        {"word": "today", "start": 0.8, "end": 1.2, "probability": 0.98},
+        {"word": "we're", "start": 1.3, "end": 1.5, "probability": 0.95},
+        {"word": "going", "start": 1.6, "end": 1.8, "probability": 0.95},
+        {"word": "to", "start": 1.9, "end": 2.0, "probability": 0.95},
+        {"word": "build", "start": 2.1, "end": 2.4, "probability": 0.95},
+        {"word": "uh", "start": 2.5, "end": 2.8, "probability": 0.90},
+        {"word": "a", "start": 2.9, "end": 3.0, "probability": 0.95},
+        {"word": "video", "start": 3.1, "end": 3.5, "probability": 0.95},
+        {"word": "editor", "start": 3.6, "end": 4.0, "probability": 0.95},
+    ]
+    out = analyze_fillers(words)
+    assert isinstance(out, FillerCutsResponse)
+    # Should identify at least one of the "um"/"uh" as a filler
+    # (model-dependent — we only assert the response shape is valid)
+    for c in out.cuts:
+        assert c.end > c.start
+        assert c.start >= 0.0
+
+
+@pytest.mark.slow
+def test_analyze_layout_against_real_llm() -> None:
+    """Layout plan over a sample transcript; verify full coverage of duration."""
+    if not _server_reachable():
+        pytest.skip("LLM server not running")
+    words = [
+        {"word": "Hey", "start": 0.0, "end": 0.3, "probability": 0.99},
+        {"word": "everyone", "start": 0.4, "end": 1.0, "probability": 0.99},
+        {"word": "let", "start": 2.0, "end": 2.2, "probability": 0.99},
+        {"word": "me", "start": 2.3, "end": 2.4, "probability": 0.99},
+        {"word": "show", "start": 2.5, "end": 2.8, "probability": 0.99},
+        {"word": "you", "start": 2.9, "end": 3.1, "probability": 0.99},
+        {"word": "a", "start": 3.2, "end": 3.3, "probability": 0.99},
+        {"word": "demo", "start": 3.4, "end": 3.8, "probability": 0.99},
+        {"word": "thanks", "start": 27.0, "end": 27.4, "probability": 0.99},
+        {"word": "bye", "start": 28.0, "end": 28.3, "probability": 0.99},
+    ]
+    out = analyze_layout(words, total_duration=30.0)
+    assert isinstance(out, LayoutPlanResponse)
+    # Full coverage invariant (after post-processing)
+    total = sum(s.end - s.start for s in out.segments)
+    assert abs(total - 30.0) < 0.1, total
+    # Every layout is a valid enum
+    for s in out.segments:
+        assert s.layout in ("cam_full", "pip", "screen_full")
