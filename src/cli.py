@@ -50,9 +50,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_paths(p_analyze)
 
     p_dead = sub.add_parser("detect-dead", help="Stage C — screen dead-zone detect")
-    p_dead.add_argument("--screen", type=Path, required=True)
-    p_dead.add_argument("--webcam", type=Path, required=True)
-    p_dead.add_argument("--words", type=Path, required=True)
+    p_dead.add_argument("--screen", type=Path, required=True,
+                        help="Screen recording (for freezedetect)")
+    p_dead.add_argument("--webcam", type=Path, required=True,
+                        help="Webcam recording (default audio source for silencedetect)")
+    p_dead.add_argument("--audio", type=Path, default=None,
+                        help="Audio source override (default: --webcam)")
+    p_dead.add_argument("--words", type=Path, default=None,
+                        help="words.json — optional, enables LLM transcript cues (not yet implemented)")
     _add_common_paths(p_dead)
 
     p_unify = sub.add_parser("unify", help="Stage D — merge decisions into segments.json")
