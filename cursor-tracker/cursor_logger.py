@@ -85,12 +85,13 @@ class CursorLogger:
     def on_clap(self) -> None:
         self._log("clap")
         print(f"  · clap cue at t={time.monotonic()-self.t0:.2f}s — flashing screen")
-        # Spawn flash as subprocess so tkinter gets its own interpreter instance
-        # (avoids threading issues with pynput's listener).
+        # Spawn flash as a separate process so AppKit / NSApp gets its own
+        # interpreter instance (avoids main-thread conflicts with pynput's
+        # listeners). stderr stays attached so flash errors are visible —
+        # stdout is muted since we don't need the normal output.
         subprocess.Popen(
             [sys.executable, str(FLASH_SCRIPT)],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
             close_fds=True,
         )
 

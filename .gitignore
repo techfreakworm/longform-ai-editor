@@ -22,9 +22,11 @@ output/
 *.wav
 *.mp3
 
-# Test fixtures EXCLUDED from gitignore — we want them tracked.
-# Uncomment the next line if you prefer LFS or out-of-band fixtures:
-# tests/fixtures/*.mkv
+# Large binary test fixtures — don't commit; regenerate or provide on demand.
+tests/fixtures/*.mkv
+tests/fixtures/*.wav
+tests/fixtures/*.mp4
+tests/fixtures/*.mp3
 
 # macOS
 .DS_Store

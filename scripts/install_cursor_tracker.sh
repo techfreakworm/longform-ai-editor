@@ -49,6 +49,11 @@ echo "▶ installing pynput into venv"
 source "$VENV/bin/activate"
 pip install --quiet --upgrade pip
 pip install --quiet -r "$TRACKER/requirements.txt"
+# Quick import smoke test so install failures surface now, not at first clap.
+python -c "import pynput; import AppKit" || {
+  echo "error: installed packages failed to import" >&2
+  exit 1
+}
 deactivate
 
 # 4. Make scripts executable
