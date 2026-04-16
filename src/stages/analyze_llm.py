@@ -98,25 +98,36 @@ def call_llm_json(
     server_url: str | None = None,
     model: str | None = None,
     timeout_s: float | None = None,
-    max_tokens: int = 8192,
+    max_tokens: int = 4096,
     temperature: float = 0.0,
 ) -> dict[str, Any]:
-    """POST to /v1/chat/completions with JSON mode. Returns the parsed body.
+    """POST to /v1/chat/completions asking for JSON output.
 
-    Does NOT validate the body against any schema — caller's responsibility.
-    Raises on HTTP error, timeout, malformed JSON.
+    We do NOT use mlx_lm.server's `response_format={"type": "json_object"}`
+    constrained-decoding mode — it can hang mlx_lm.server on longer
+    prompts (observed: the server sends HTTP 200 headers, then never
+    writes the body, leaving the client blocked even with multi-minute
+    timeouts). Instead we ask the model for JSON via a strict system
+    prompt suffix and then extract the outermost `{...}` from whatever
+    comes back. A good instruction-tuned model (Llama 3.3 70B, Qwen3)
+    complies reliably at temperature=0.
+
+    Raises on HTTP error, timeout, or malformed JSON after extraction.
     """
     server_url = server_url or config.LLM_SERVER_URL
     model = model or config.LLM_MODEL
     timeout_s = timeout_s or config.LLM_TIMEOUT_SEC
 
+    system_with_json = (
+        system_prompt.rstrip()
+        + "\n\nReturn ONLY a valid JSON object. No markdown fences, no preamble, no commentary."
+    )
     payload = {
         "model": model,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"},
         "messages": [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": system_with_json},
             {"role": "user", "content": __import__("json").dumps(user_payload)},
         ],
     }

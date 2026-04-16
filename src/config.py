@@ -32,7 +32,10 @@ LLM_SERVER_URL = os.getenv("LLM_SERVER_URL", "http://127.0.0.1:8080/v1")
 # Qwen3-235B-A22B considered and rejected (full repo = 125 GB, would cause
 # memory pressure or swap). Qwen3-30B-A3B available as opt-in fallback.
 LLM_MODEL = os.getenv("LLM_MODEL", "mlx-community/Llama-3.3-70B-Instruct-4bit")
-LLM_TIMEOUT_SEC = _f("LLM_TIMEOUT_SEC", 120.0)
+# mlx_lm.server's JSON-mode constrained decoding is much slower than plain
+# generation on 70B models — budget generous defaults. Real-world measured:
+# a 47-word transcript with the full filler prompt takes ~60–180s.
+LLM_TIMEOUT_SEC = _f("LLM_TIMEOUT_SEC", 600.0)
 LLM_MAX_RETRIES = _i("LLM_MAX_RETRIES", 3)
 
 # ----- Transcription ----------------------------------------------------
