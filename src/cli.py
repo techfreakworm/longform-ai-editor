@@ -69,9 +69,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_paths(p_unify)
 
     p_render = sub.add_parser("render", help="Stage E — ffmpeg render")
-    p_render.add_argument("--screen", type=Path, required=True)
-    p_render.add_argument("--webcam", type=Path, required=True)
-    p_render.add_argument("--segments", type=Path, required=True)
+    p_render.add_argument("--screen", type=Path, required=True,
+                          help="Screen recording source (e.g. ext.mov)")
+    p_render.add_argument("--webcam", type=Path, required=True,
+                          help="Webcam video source (e.g. cam.mov)")
+    p_render.add_argument("--audio", type=Path, default=None,
+                          help="Audio source (defaults to --webcam's audio)")
+    p_render.add_argument("--segments", type=Path, required=True,
+                          help="segments.json from Stage D")
     p_render.add_argument("--output", type=Path, required=True)
     _add_common_paths(p_render)
 
