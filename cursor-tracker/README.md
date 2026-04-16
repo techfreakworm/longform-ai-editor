@@ -75,13 +75,13 @@ Then fully quit and re-open the terminal before re-running.
 **Flash doesn't appear**
 - Verify PyObjC is installed: `python -c "import AppKit"` from the cursor-tracker
   venv should succeed. If it fails, rerun `./scripts/install_cursor_tracker.sh`.
-- The flash uses the **main display** (`NSScreen.mainScreen()`). If OBS is
-  capturing a secondary display, the flash isn't visible in OBS's recording.
-  Move OBS's Display Capture to the main display before recording.
+- The flash fires on **every connected display simultaneously**, so it works
+  without configuration whether OBS is capturing your built-in screen, an
+  external monitor, or any combination.
 - Test the flash standalone first: `python cursor-tracker/screen_flash.py --duration 0.5`
-  (500 ms — visibly human-readable). If that works but the hotkey version doesn't,
-  run `./cursor-tracker/record.sh` and watch for stderr from the flash subprocess
-  when you press the hotkey.
+  (500 ms — human-visible). You should see every monitor go white for half a second.
+  If that works but the hotkey version doesn't, run `./cursor-tracker/record.sh`
+  and watch for stderr from the flash subprocess when you press the hotkey.
 
 **Flash appears but OBS didn't capture it**
 OBS Display Capture on macOS sometimes clips the top menu bar or dock area.

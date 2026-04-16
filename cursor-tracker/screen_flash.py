@@ -45,35 +45,45 @@ except ImportError as e:
 
 
 def flash(duration_s: float = 0.08) -> None:
-    """Show a full-screen white window for duration_s seconds, then close."""
+    """Show a full-screen white window on every connected display for duration_s.
+
+    Flashing all displays ensures the flash is captured no matter which
+    display OBS's Display Capture is pointed at, and without needing
+    per-setup configuration. On a typical 2-monitor rig (macbook built-in
+    + external), two windows briefly appear and close in unison; only one
+    is visible in the OBS recording — which is exactly what we need.
+    """
     app = NSApplication.sharedApplication()
     # Accessory = runs without a dock icon and doesn't steal focus.
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 
-    screen = NSScreen.mainScreen()
-    if screen is None:
-        raise RuntimeError("no main screen detected")
-    frame = screen.frame()
+    screens = NSScreen.screens()
+    if not screens:
+        raise RuntimeError("no screens detected")
 
-    window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-        frame,
-        NSWindowStyleMaskBorderless,
-        NSBackingStoreBuffered,
-        False,
-    )
-    window.setBackgroundColor_(NSColor.whiteColor())
-    window.setOpaque_(True)
-    # ScreenSaver level sits above the menu bar + every app window.
-    window.setLevel_(NSScreenSaverWindowLevel)
-    window.setIgnoresMouseEvents_(True)
-    window.orderFrontRegardless()
+    windows = []
+    for screen in screens:
+        window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            screen.frame(),
+            NSWindowStyleMaskBorderless,
+            NSBackingStoreBuffered,
+            False,
+        )
+        window.setBackgroundColor_(NSColor.whiteColor())
+        window.setOpaque_(True)
+        # ScreenSaver level sits above the menu bar + every app window.
+        window.setLevel_(NSScreenSaverWindowLevel)
+        window.setIgnoresMouseEvents_(True)
+        window.orderFrontRegardless()
+        windows.append(window)
 
-    # Pump the event loop for duration_s so the window paints and holds,
+    # Pump the event loop for duration_s so the windows paint and hold,
     # then fall through to close.
     deadline = NSDate.dateWithTimeIntervalSinceNow_(duration_s)
     NSRunLoop.currentRunLoop().runUntilDate_(deadline)
 
-    window.orderOut_(None)
+    for window in windows:
+        window.orderOut_(None)
 
 
 def main() -> int:
