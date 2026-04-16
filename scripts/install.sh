@@ -102,9 +102,9 @@ else
   hf auth login
 fi
 
-echo "  ▶ pre-pulling models to ~/.cache/huggingface (one-time, ~36 GB)"
+echo "  ▶ pre-pulling models to ~/.cache/huggingface (one-time, ~41 GB)"
 hf download mlx-community/whisper-large-v3-turbo
-hf download Qwen/Qwen3-235B-A22B-MLX-4bit
+hf download mlx-community/Llama-3.3-70B-Instruct-4bit
 
 # --- Done ----------------------------------------------------------------
 cat <<'DONE'
@@ -119,7 +119,7 @@ Next steps:
 3. Start the LLM server in a separate terminal:
 
      source venv/bin/activate
-     mlx_lm.server --model Qwen/Qwen3-235B-A22B-MLX-4bit --port 8080
+     mlx_lm.server --model mlx-community/Llama-3.3-70B-Instruct-4bit --port 8080
 
 4. Verify the environment:
 

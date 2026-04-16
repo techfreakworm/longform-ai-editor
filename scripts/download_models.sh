@@ -2,22 +2,30 @@
 # Download Hugging Face model weights for long-form-editor.
 #
 # Usage:
-#   ./scripts/download_models.sh                # core only (Whisper + Qwen3)
-#   ./scripts/download_models.sh --all          # core + fallback + parakeet
-#   ./scripts/download_models.sh --with-llama   # core + Llama-3.3-70B fallback
-#   ./scripts/download_models.sh --with-parakeet
+#   ./scripts/download_models.sh                # core only (default stack, ~41 GB)
+#   ./scripts/download_models.sh --with-qwen3-small   # + Qwen3-30B-A3B MoE fast fallback (~17 GB)
+#   ./scripts/download_models.sh --with-parakeet      # + Parakeet alt ASR (~2.5 GB)
+#   ./scripts/download_models.sh --all                # everything
 #
-# First run does `hf auth login` interactively if not already authed.
-# Subsequent runs are idempotent (hf download is a cache-aware fetcher).
+# Verified sizes (via HfApi.repo_info, 2026-04-17):
+#   mlx-community/whisper-large-v3-turbo                1.6 GB
+#   mlx-community/Llama-3.3-70B-Instruct-4bit          39.7 GB
+#   mlx-community/Qwen3-30B-A3B-4bit                   17.2 GB  (opt)
+#   mlx-community/parakeet-tdt-0.6b-v3                  2.5 GB  (opt)
+#
+# Note: the earlier plan called for Qwen3-235B-A22B-MLX-4bit (~125 GB full
+# repo size). That's too tight on 128 GB unified memory — model + KV cache
+# + OS would exceed physical RAM. Llama 3.3 70B 4-bit is the right primary
+# for this host class.
 set -euo pipefail
 
 CORE=(
-  "mlx-community/whisper-large-v3-turbo:Whisper large-v3 turbo (MLX):~3 GB"
-  "Qwen/Qwen3-235B-A22B-MLX-4bit:Qwen3-235B-A22B MLX 4-bit (primary LLM):~33 GB"
+  "mlx-community/whisper-large-v3-turbo:Whisper large-v3 turbo (ASR):~1.6 GB"
+  "mlx-community/Llama-3.3-70B-Instruct-4bit:Llama 3.3 70B MLX 4-bit (primary LLM):~39.7 GB"
 )
 
-OPTIONAL_LLAMA=(
-  "mlx-community/Llama-3.3-70B-Instruct-4bit:Llama 3.3 70B MLX 4-bit (LLM fallback):~40 GB"
+OPTIONAL_QWEN3_SMALL=(
+  "mlx-community/Qwen3-30B-A3B-4bit:Qwen3-30B-A3B MLX 4-bit (fast MoE fallback, 3B active):~17.2 GB"
 )
 
 OPTIONAL_PARAKEET=(
@@ -25,13 +33,13 @@ OPTIONAL_PARAKEET=(
 )
 
 # --- Parse flags --------------------------------------------------------
-WANT_LLAMA=0
+WANT_QWEN_SMALL=0
 WANT_PARAKEET=0
 for arg in "$@"; do
   case "$arg" in
-    --all)           WANT_LLAMA=1; WANT_PARAKEET=1 ;;
-    --with-llama)    WANT_LLAMA=1 ;;
-    --with-parakeet) WANT_PARAKEET=1 ;;
+    --all)                WANT_QWEN_SMALL=1; WANT_PARAKEET=1 ;;
+    --with-qwen3-small)   WANT_QWEN_SMALL=1 ;;
+    --with-parakeet)      WANT_PARAKEET=1 ;;
     -h|--help)
       grep -E "^# " "$0" | sed 's/^# \?//'
       exit 0
@@ -62,8 +70,8 @@ fi
 
 # --- Build the list -----------------------------------------------------
 PLAN=("${CORE[@]}")
-[[ $WANT_LLAMA    -eq 1 ]] && PLAN+=("${OPTIONAL_LLAMA[@]}")
-[[ $WANT_PARAKEET -eq 1 ]] && PLAN+=("${OPTIONAL_PARAKEET[@]}")
+[[ $WANT_QWEN_SMALL -eq 1 ]] && PLAN+=("${OPTIONAL_QWEN3_SMALL[@]}")
+[[ $WANT_PARAKEET   -eq 1 ]] && PLAN+=("${OPTIONAL_PARAKEET[@]}")
 
 echo
 echo "▶ planned downloads:"
@@ -95,7 +103,7 @@ echo
 echo "next steps:"
 echo "  1. start the LLM server in a terminal:"
 echo
-echo "       mlx_lm.server --model Qwen/Qwen3-235B-A22B-MLX-4bit --port 8080"
+echo "       mlx_lm.server --model mlx-community/Llama-3.3-70B-Instruct-4bit --port 8080"
 echo
 echo "  2. verify everything:"
 echo

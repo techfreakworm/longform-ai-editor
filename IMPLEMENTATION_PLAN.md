@@ -162,7 +162,7 @@ This milestone can ship independently of M1–M6 so you can start recording with
 **Test:** on a 60 s test clip with known fillers, verify ≥ 80% filler recall. Layout plan covers entire duration with no gaps and only valid enum values.
 
 **Gotchas:**
-- mlx_lm.server must be running (`mlx_lm.server --model Qwen/Qwen3-235B-A22B-MLX-4bit --port 8080`). Script checks `/v1/models` endpoint first.
+- mlx_lm.server must be running (`mlx_lm.server --model mlx-community/Llama-3.3-70B-Instruct-4bit --port 8080`). Script checks `/v1/models` endpoint first.
 - `response_format={"type": "json_object"}` isn't always respected — validate with `jsonschema` and retry up to 3 times with stricter prompt.
 - Qwen3's thinking mode can inject `<think>...</think>` tags into the output. Strip before json.loads.
 - Layout plan must cover entire duration — if LLM returns gaps, post-process to fill with previous segment's layout.
@@ -313,8 +313,14 @@ All installed via `scripts/install.sh`:
 - `obs-source-record` 0.4.8 `.pkg` from [release page](https://github.com/exeldro/obs-source-record/releases/tag/0.4.8)
 
 ### HuggingFace models (one-time pull to ~/.cache/huggingface)
-- `mlx-community/whisper-large-v3-turbo` — ~3 GB
-- `Qwen/Qwen3-235B-A22B-MLX-4bit` — 33 GB
+- `mlx-community/whisper-large-v3-turbo` — 1.6 GB
+- `mlx-community/Llama-3.3-70B-Instruct-4bit` — 39.7 GB (primary LLM)
+- `mlx-community/Qwen3-30B-A3B-4bit` — 17.2 GB (optional fast fallback)
+
+**Note:** the original research doc suggested Qwen3-235B-A22B-MLX-4bit (~125 GB full
+repo). That was measured and rejected — on 128 GB unified memory the
+model + KV cache + OS would exceed physical RAM. Llama 3.3 70B 4-bit is
+the right primary for this host class.
 
 ### Cursor tracker (separate venv, can install alone)
 - `pynput` — global mouse/keyboard hooks (requires macOS Accessibility + Input Monitoring perms)
@@ -339,7 +345,7 @@ OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "./output"))
 
 # LLM server
 LLM_SERVER_URL = os.getenv("LLM_SERVER_URL", "http://127.0.0.1:8080/v1")
-LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen3-235B-A22B-MLX-4bit")
+LLM_MODEL = os.getenv("LLM_MODEL", "mlx-community/Llama-3.3-70B-Instruct-4bit")
 
 # Transcription
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "mlx-community/whisper-large-v3-turbo")

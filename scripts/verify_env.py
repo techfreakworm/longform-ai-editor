@@ -95,7 +95,7 @@ def check_llm_server() -> bool:
     except Exception as e:
         warn(f"{url} not reachable — {e}")
         warn("  start it with:")
-        warn("  mlx_lm.server --model Qwen/Qwen3-235B-A22B-MLX-4bit --port 8080")
+        warn("  mlx_lm.server --model mlx-community/Llama-3.3-70B-Instruct-4bit --port 8080")
         return False
 
 
@@ -105,7 +105,7 @@ def check_models() -> bool:
     cache = Path.home() / ".cache" / "huggingface" / "hub"
     needed = [
         "models--mlx-community--whisper-large-v3-turbo",
-        "models--Qwen--Qwen3-235B-A22B-MLX-4bit",
+        "models--mlx-community--Llama-3.3-70B-Instruct-4bit",
     ]
     missing = []
     for m in needed:

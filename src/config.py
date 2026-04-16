@@ -27,7 +27,11 @@ OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "./output")).expanduser().resolve()
 
 # ----- LLM --------------------------------------------------------------
 LLM_SERVER_URL = os.getenv("LLM_SERVER_URL", "http://127.0.0.1:8080/v1")
-LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen3-235B-A22B-MLX-4bit")
+# 70B @ 4-bit = 39.7 GB on disk; comfortable in 128 GB unified memory with
+# ~20 GB OS + browser + ~10 GB KV cache at 32k context. Strong JSON mode.
+# Qwen3-235B-A22B considered and rejected (full repo = 125 GB, would cause
+# memory pressure or swap). Qwen3-30B-A3B available as opt-in fallback.
+LLM_MODEL = os.getenv("LLM_MODEL", "mlx-community/Llama-3.3-70B-Instruct-4bit")
 LLM_TIMEOUT_SEC = _f("LLM_TIMEOUT_SEC", 120.0)
 LLM_MAX_RETRIES = _i("LLM_MAX_RETRIES", 3)
 

@@ -31,7 +31,7 @@ See [`cursor-tracker/README.md`](cursor-tracker/README.md) for details.
 python scripts/verify_env.py      # checks ffmpeg, auto-editor, mlx_lm, models
 
 # Per session
-mlx_lm.server --model Qwen/Qwen3-235B-A22B-MLX-4bit --port 8080 &
+mlx_lm.server --model mlx-community/Llama-3.3-70B-Instruct-4bit --port 8080 &
 python -m src.cli run \
     --screen ~/sessions/ep01/screen_raw.mkv \
     --webcam ~/sessions/ep01/webcam_raw.mkv \
