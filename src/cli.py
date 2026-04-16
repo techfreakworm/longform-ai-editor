@@ -31,10 +31,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_sync = sub.add_parser("sync", help="Stage A — clap-cue sync")
-    p_sync.add_argument("--screen", type=Path, required=True)
-    p_sync.add_argument("--webcam", type=Path, required=True)
+    p_sync.add_argument("--screen", type=Path, required=True,
+                        help="Screen recording (silent or with audio)")
+    p_sync.add_argument("--webcam", type=Path, required=True,
+                        help="Webcam recording (used for audio clap detection)")
+    p_sync.add_argument("--cursor", type=Path, default=None,
+                        help="cursor.csv from cursor-tracker (for CSV alignment)")
+    p_sync.add_argument("--trim", action="store_true",
+                        help="Also write trimmed screen_synced.mkv + webcam_synced.mkv "
+                             "(needed only when source files are NOT already OBS-synced)")
     p_sync.add_argument("--manual-offset", type=float, default=None,
-                        help="Skip auto-detection, apply this offset (seconds)")
+                        help="Skip auto-detection, apply this video-to-video offset (seconds)")
     _add_common_paths(p_sync)
 
     p_analyze = sub.add_parser("analyze", help="Stage B — transcribe + LLM")
