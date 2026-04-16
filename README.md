@@ -39,9 +39,9 @@ M5 Max. The pipeline:
 | M3 · Stage C dead-zone detect | freezedetect + silencedetect intersection | ✅ | 32 |
 | M4 · Stage D unify segments | merge all decisions → canonical edit list | ✅ | 46 |
 | M5 · Stage E render | single-pass ffmpeg filter_complex | ✅ | 30 |
-| M6 · Stage F polish | DeepFilterNet + ffmpeg-normalize -14 LUFS | 🔴 TODO | — |
+| M6 · Stage F polish | (optional) DeepFilterNet denoise + ffmpeg-normalize EBU R128 | ✅ | 10 |
 
-**180 tests passing** (169 fast + 11 integration against real ffmpeg / LLM / fixtures).
+**190 tests passing** (179 fast + 11 integration against real ffmpeg / LLM / fixtures).
 
 ---
 
@@ -254,10 +254,15 @@ artifacts to force a re-run of that stage.
 
 ## Limitations (honest)
 
-- **M6 polish stage is TODO.** Output is pre-loudness-normalization and has no
-  denoise pass. YouTube will happily accept it, but the -14 LUFS target isn't
-  enforced yet. Workaround: run `ffmpeg-normalize -nt ebu -t -14 -tp -1.5
-  -lra 11 -o final_polished.mp4 final.mp4` as a manual post-step.
+- **DeepFilterNet denoise is opt-in.** `deep-filter` binary isn't installed
+  by the pipeline's install script — grab the `aarch64-apple-darwin` release
+  from https://github.com/Rikorose/DeepFilterNet/releases and put it on
+  PATH. Without it, Stage F silently skips denoise and still does loudnorm.
+- **Short clips may land up to ±2.5 LU from the -14 LUFS target.** EBU R128
+  auto-switches to dynamic mode when input LRA exceeds target LRA (common
+  on short samples with mixed speech + silence). Dynamic mode is the safer
+  choice per the spec — it preserves peaks without clipping. For a full
+  30-min tutorial the result usually lands within ±0.5 LU.
 - **macOS only.** MLX is Apple-silicon-specific; ScreenCaptureKit is macOS-specific.
 - **mlx_lm.server must run on `--port 8080`.** Override via `.env`
   (`LLM_SERVER_URL=http://host:port/v1`).

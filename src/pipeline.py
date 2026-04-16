@@ -99,16 +99,17 @@ def run_all(args: argparse.Namespace) -> int:
         return rc
 
     # -----------------------------------------------------------
-    # Stage E — render
+    # Stage E — render to an intermediate; Stage F produces the final.
     # -----------------------------------------------------------
     print("\n========= Stage E — render =========")
     from src.stages.render import run as render_run
+    composed = work_dir / "composed.mp4"
     render_args = argparse.Namespace(
         screen=screen,
         webcam=webcam,
         audio=audio,
         segments=work_dir / "segments.json",
-        output=output,
+        output=composed,
         **common,
     )
     rc = render_run(render_args)
@@ -116,9 +117,19 @@ def run_all(args: argparse.Namespace) -> int:
         return rc
 
     # -----------------------------------------------------------
-    # Stage F — polish (M6 — TODO)
+    # Stage F — polish (denoise + EBU R128 loudnorm)
     # -----------------------------------------------------------
-    if not getattr(args, "skip_denoise", False):
-        log.info("Stage F (polish) is not yet implemented; skipping")
+    print("\n========= Stage F — polish =========")
+    from src.stages.polish import run as polish_run
+    polish_args = argparse.Namespace(
+        input=composed,
+        output=output,
+        skip_denoise=getattr(args, "skip_denoise", False),
+        **common,
+    )
+    rc = polish_run(polish_args)
+    if rc != 0:
+        return rc
+
     print(f"\n✓ pipeline complete: {output}")
     return 0

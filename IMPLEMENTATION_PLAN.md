@@ -103,7 +103,7 @@ Estimate 1–3 evenings per milestone on M5 Max.
 | M3 — Stage C (dead-zone detect) | ✅ done | 32 |
 | M4 — Stage D (unify segments) | ✅ done | 46 |
 | M5 — Stage E (render) | ✅ done | 30 |
-| **M6 — Stage F (polish + integration)** | 🔴 TODO | — |
+| M6 — Stage F (polish) | ✅ done | 10 |
 
 End-to-end verified against real OBS fixtures: 95.75 s source →
 42.99 s 1920×1080 HEVC 60fps in 7.6 s render wall-clock.
@@ -280,7 +280,7 @@ This milestone can ship independently of M1–M6 so you can start recording with
 - VideoToolbox encoder doesn't like some pixel formats — force `format=yuv420p` on the final chain.
 - For cursor zoom, use pre-segment `crop` with `scale` to 1080p rather than per-frame expressions — simpler and faster.
 
-### M6 — Stage F: polish + integration test  🔴 TODO
+### M6 — Stage F: polish + integration test  ✅ DONE
 
 **DoD.** `python -m src.cli run --screen raw_screen.mkv --webcam raw_webcam.mkv` runs the full pipeline end-to-end. Output `final.mp4` is -14 LUFS compliant (verified via `ffmpeg-normalize --print-stats`).
 
