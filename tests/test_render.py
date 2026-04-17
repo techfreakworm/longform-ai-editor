@@ -428,7 +428,10 @@ def test_build_filter_pip_circle_loads_mask_via_movie() -> None:
 def test_build_filter_pip_circle_uses_alphamerge() -> None:
     rs = [RenderSegment(start=0, end=10, speed=1.0, layout="pip", zoom=None)]
     fc = build_filter_complex(rs, RenderOptions())
-    assert "alphamerge" in fc
+    # shortest=1 is required because the mask stream is looped infinitely —
+    # without it, alphamerge's default eof_action=repeat would keep emitting
+    # frames after the webcam ends and the downstream concat would stall.
+    assert "alphamerge=shortest=1" in fc
     # Webcam needs an alpha-capable pixel format BEFORE alphamerge so the
     # merged alpha survives through to overlay.
     assert "format=yuva420p" in fc
@@ -472,8 +475,67 @@ def test_build_filter_pip_circle_produces_w_pip_label() -> None:
     """
     rs = [RenderSegment(start=0, end=10, speed=1.0, layout="pip", zoom=None)]
     fc = build_filter_complex(rs, RenderOptions())
-    # alphamerge writes its result to [w0_pip] (same label as rect path).
-    assert "[w0_sq][m0]alphamerge[w0_pip]" in fc
+    # The mask is loaded once at the top of the graph and split into N
+    # per-segment labels (m_pip_{k}); segment 0 consumes m_pip_0.
+    assert "[w0_sq][m_pip_0]alphamerge=shortest=1[w0_pip]" in fc
+
+
+def test_build_filter_pip_circle_shared_mask_prefix_single_segment() -> None:
+    """One circle PIP → single labeled mask stream, no split filter."""
+    rs = [RenderSegment(start=0, end=10, speed=1.0, layout="pip", zoom=None)]
+    fc = build_filter_complex(rs, RenderOptions())
+    # movie+loop appears exactly once (not per segment).
+    assert fc.count("movie='") == 1
+    assert fc.count("loop=loop=-1:size=1") == 1
+    # split=1 is superfluous and should be omitted — just the labeled output.
+    assert "split=1" not in fc
+    assert "[m_pip_0]" in fc
+
+
+def test_build_filter_pip_circle_shared_mask_prefix_multi_segment() -> None:
+    """Multiple circle PIPs → one movie load + split=N + N labels."""
+    rs = [
+        RenderSegment(start=0, end=5, speed=1.0, layout="pip", zoom=None),
+        RenderSegment(start=5, end=10, speed=1.0, layout="pip", zoom=None),
+        RenderSegment(start=10, end=15, speed=1.0, layout="pip", zoom=None),
+    ]
+    fc = build_filter_complex(rs, RenderOptions())
+    # One `movie=` regardless of segment count — this is the main OOM fix:
+    # before sharing, 100+ PIP segments meant 100+ file opens on the PNG.
+    assert fc.count("movie='") == 1
+    assert "split=3[m_pip_0][m_pip_1][m_pip_2]" in fc
+    # Each segment consumes its own label.
+    assert "[w0_sq][m_pip_0]alphamerge=shortest=1[w0_pip]" in fc
+    assert "[w1_sq][m_pip_1]alphamerge=shortest=1[w1_pip]" in fc
+    assert "[w2_sq][m_pip_2]alphamerge=shortest=1[w2_pip]" in fc
+
+
+def test_build_filter_pip_circle_mask_prefix_skipped_when_rect() -> None:
+    rs = [RenderSegment(start=0, end=10, speed=1.0, layout="pip", zoom=None)]
+    fc = build_filter_complex(rs, RenderOptions(pip_shape="rect"))
+    assert "movie='" not in fc
+    assert "[m_pip_" not in fc
+
+
+def test_build_filter_pip_circle_mask_index_skips_non_pip_segments() -> None:
+    """Intro cam_full + two PIPs + outro cam_full → mask labels 0,1 only
+    (not 0,3). The indexing counts circle-PIPs, NOT segment indices.
+    """
+    rs = [
+        RenderSegment(start=0, end=5, speed=1.0, layout="cam_full", zoom=None),
+        RenderSegment(start=5, end=10, speed=1.0, layout="pip", zoom=None),
+        RenderSegment(start=10, end=15, speed=1.0, layout="screen_full", zoom=None),
+        RenderSegment(start=15, end=20, speed=1.0, layout="pip", zoom=None),
+        RenderSegment(start=20, end=25, speed=1.0, layout="cam_full", zoom=None),
+    ]
+    fc = build_filter_complex(rs, RenderOptions())
+    # Segments 1 and 3 are PIPs → mask labels 0 and 1.
+    assert "split=2[m_pip_0][m_pip_1]" in fc
+    assert "[w1_sq][m_pip_0]alphamerge=shortest=1[w1_pip]" in fc
+    assert "[w3_sq][m_pip_1]alphamerge=shortest=1[w3_pip]" in fc
+    # No stray labels from non-PIP segment indices.
+    assert "m_pip_2" not in fc
+    assert "m_pip_3" not in fc
 
 
 def test_build_filter_pip_rect_has_no_alphamerge_or_movie() -> None:
@@ -500,19 +562,20 @@ def test_build_filter_pip_circle_overlay_unchanged() -> None:
 
 
 def test_build_filter_pip_circle_unique_labels_per_segment() -> None:
-    """Two PIP segments must get distinct mask/square labels so ffmpeg
-    doesn't reject duplicate filter outputs.
+    """Two PIP segments must get distinct per-segment labels so ffmpeg
+    doesn't reject duplicate filter outputs. The shared mask is split
+    into per-segment labels (m_pip_0, m_pip_1, ...).
     """
     rs = [
         RenderSegment(start=0, end=5, speed=1.0, layout="pip", zoom=None),
         RenderSegment(start=5, end=10, speed=1.0, layout="pip", zoom=None),
     ]
     fc = build_filter_complex(rs, RenderOptions())
-    # Each segment gets its own mask load and square intermediate.
-    assert "[m0]" in fc and "[m1]" in fc
+    # Each segment gets its own square intermediate and pip output.
     assert "[w0_sq]" in fc and "[w1_sq]" in fc
-    # And its own alphamerge output.
     assert "[w0_pip]" in fc and "[w1_pip]" in fc
+    # Each consumes its own split of the shared mask.
+    assert "[m_pip_0]" in fc and "[m_pip_1]" in fc
 
 
 # --- unknown-layout safety ------------------------------------------

@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 import tempfile
@@ -79,12 +80,24 @@ class RenderOptions:
     cam_face_x: float = field(default_factory=lambda: config.PIP_FACE_X)
     cam_face_y: float = field(default_factory=lambda: config.PIP_FACE_Y)
     circle_mask_path: Path = field(default_factory=lambda: config.CIRCLE_MASK_PATH)
+    # Chunk the render into batches of this many segments. Long-form
+    # content (2000+ s) with many speed-ramped segments hits a buffer
+    # blowup in the concat filter — atempo + setpts timestamps drift by
+    # a few samples per segment, piling up in the output muxer queue
+    # until OOM. Rendering chunks of ~30 segments each and concat-demuxer-
+    # copying the results dodges that path. Set to 0 to disable chunking.
+    chunk_size: int = 30
     video_bitrate: str = "12M"
     audio_bitrate: str = "192k"
     audio_sample_rate: int = 48000
     pix_fmt: str = "yuv420p"
     screen_res: tuple[int, int] = (2560, 1440)
     webcam_res: tuple[int, int] = (1920, 1080)
+    # Encoder override — "hevc_videotoolbox" is fastest on M-series but
+    # can stall on very complex graphs; "libx264" is slower but rock-
+    # solid. Chunking usually makes hevc_videotoolbox work fine, but
+    # this is the escape hatch.
+    video_encoder: str = field(default_factory=lambda: os.getenv("RENDER_ENCODER", "hevc_videotoolbox"))
 
 
 # ---------- preprocess ------------------------------------------------
@@ -275,13 +288,42 @@ def _scale_fill(out_w: int, out_h: int) -> str:
     )
 
 
-def _pip_circle_webcam_branch(i: int, opts: RenderOptions) -> list[str]:
+def _shared_mask_prefix(n_circle_pips: int, opts: RenderOptions) -> list[str]:
+    """Emit ONE chain that loads the circle mask once and splits it N ways.
+
+    Loading the mask per-segment (movie=...) worked on short clips but on
+    long content with many PIP segments it meant opening the same PNG
+    100+ times — on a 34-min recording this was a measurable contributor
+    to the OOM that killed the 173-segment render. One shared load +
+    `split=N` produces N independently-consumable streams labeled
+    `[m_pip_0]` … `[m_pip_{N-1}]`.
+
+    Returns [] if there are no circle-PIP segments — skips the mask load
+    entirely so rect-only / cam-only renders don't touch the PNG.
+    """
+    if n_circle_pips == 0:
+        return []
+    D = opts.pip_diameter
+    mask_path = str(opts.circle_mask_path)
+    base = (
+        f"movie='{mask_path}',scale={D}:{D},format=gray,"
+        f"loop=loop=-1:size=1"
+    )
+    if n_circle_pips == 1:
+        # split=1 would be valid but superfluous — just one labeled output.
+        return [f"{base}[m_pip_0]"]
+    labels = "".join(f"[m_pip_{k}]" for k in range(n_circle_pips))
+    return [f"{base},split={n_circle_pips}{labels}"]
+
+
+def _pip_circle_webcam_branch(
+    i: int, opts: RenderOptions, mask_label: str,
+) -> list[str]:
     """Filter lines that turn [w{i}_trim] into a circular [w{i}_pip].
 
-    Pipeline (three chains):
-      1. `movie=<mask>` source → scale to PIP diameter → gray → [m{i}]
-      2. [w{i}_trim] → face-centered square crop → scale to DxD → yuva420p → [w{i}_sq]
-      3. [w{i}_sq] + [m{i}] → alphamerge → [w{i}_pip]
+    Pipeline (two chains — mask was loaded once via `_shared_mask_prefix`):
+      1. [w{i}_trim] → face-centered square crop → scale to DxD → yuva420p → [w{i}_sq]
+      2. [w{i}_sq] + [mask_label] → alphamerge → [w{i}_pip]
 
     Why face-centered crop FIRST, then scale to square:
       The webcam is typically 16:9. Scaling it directly to a square would
@@ -291,13 +333,11 @@ def _pip_circle_webcam_branch(i: int, opts: RenderOptions) -> list[str]:
       the circle.
 
     Escaping: expressions with commas are wrapped in single quotes so the
-    filter-graph parser doesn't split on the inner commas. The mask path
-    is single-quoted so colons/spaces in the filename don't break parsing.
+    filter-graph parser doesn't split on the inner commas.
     """
     D = opts.pip_diameter
     cx = opts.cam_face_x
     cy = opts.cam_face_y
-    mask_path = str(opts.circle_mask_path)
 
     # Square side = shorter of the two input dimensions; ffmpeg resolves
     # `min(iw,ih)` at filter-init time, so this is a constant per segment.
@@ -306,24 +346,29 @@ def _pip_circle_webcam_branch(i: int, opts: RenderOptions) -> list[str]:
     y_expr = f"clip({cy:g}*ih-{side}/2,0,ih-{side})"
 
     return [
-        # `loop=-1:size=1` repeats the single-frame mask for the entire
-        # segment — without it, alphamerge would truncate the PIP after
-        # one frame. size=1 means "buffer 1 frame then loop it forever".
-        (
-            f"movie='{mask_path}',scale={D}:{D},format=gray,"
-            f"loop=loop=-1:size=1[m{i}]"
-        ),
         (
             f"[w{i}_trim]"
             f"crop=w='{side}':h='{side}':x='{x_expr}':y='{y_expr}',"
             f"scale={D}:{D},format=yuva420p,setsar=1"
             f"[w{i}_sq]"
         ),
-        f"[w{i}_sq][m{i}]alphamerge[w{i}_pip]",
+        # shortest=1 is the critical flag: the mask stream is looped
+        # infinitely (loop=-1 above), so alphamerge's default framesync
+        # behaviour (eof_action=repeat) would never terminate — it would
+        # keep re-emitting the webcam's final frame forever, stalling the
+        # downstream concat filter and blowing up the muxer queue. With
+        # shortest=1 the output ends when the webcam segment ends.
+        f"[w{i}_sq][{mask_label}]alphamerge=shortest=1[w{i}_pip]",
     ]
 
 
-def _segment_branches(i: int, rs: RenderSegment, opts: RenderOptions) -> list[str]:
+def _segment_branches(
+    i: int,
+    rs: RenderSegment,
+    opts: RenderOptions,
+    *,
+    mask_label: str | None = None,
+) -> list[str]:
     """All filter lines needed to produce [v{i}] and [a{i}] for segment i.
 
     Only emits the input branches each layout actually needs — ffmpeg
@@ -331,6 +376,9 @@ def _segment_branches(i: int, rs: RenderSegment, opts: RenderOptions) -> list[st
     output unconnected), so cam_full skips the screen branch entirely
     and screen_full skips the webcam-video branch entirely. Audio is
     always needed.
+
+    `mask_label` is the pre-assigned shared-mask label (e.g. "m_pip_5")
+    for circle-PIP segments; None for all other layouts/shapes.
     """
     lines: list[str] = []
     needs_screen_video = rs.layout in ("pip", "screen_full")
@@ -393,8 +441,13 @@ def _segment_branches(i: int, rs: RenderSegment, opts: RenderOptions) -> list[st
         if opts.pip_shape == "circle":
             # Circle path: face-centered square crop + alphamerge with mask.
             # Emits [w{i}_pip] — the same label the rectangle path produces,
-            # so the overlay line below is shape-agnostic.
-            lines.extend(_pip_circle_webcam_branch(i, opts))
+            # so the overlay line below is shape-agnostic. mask_label is
+            # pre-assigned in build_filter_complex so every PIP segment
+            # consumes a unique split of the one shared mask stream.
+            assert mask_label is not None, (
+                "circle PIP segment got no mask label — build_filter_complex bug"
+            )
+            lines.extend(_pip_circle_webcam_branch(i, opts, mask_label))
         else:
             lines.append(
                 f"[w{i}_trim]{_scale_fill(opts.pip_w, opts.pip_h)},"
@@ -423,9 +476,25 @@ def build_filter_complex(
     if not render_segments:
         raise ValueError("no render segments — nothing to render")
 
+    # Pre-pass: assign a shared-mask label to every circle-PIP segment.
+    # Counting up front lets us emit ONE `movie=...` + split=N at the top
+    # of the graph instead of N separate file opens during rendering.
+    mask_labels: dict[int, str] = {}
+    if options.pip_shape == "circle":
+        k = 0
+        for i, rs in enumerate(render_segments):
+            if rs.layout == "pip":
+                mask_labels[i] = f"m_pip_{k}"
+                k += 1
+
     lines: list[str] = []
+    # Mask prefix comes first so its labels exist before any consumer.
+    lines.extend(_shared_mask_prefix(len(mask_labels), options))
+
     for i, rs in enumerate(render_segments):
-        lines.extend(_segment_branches(i, rs, options))
+        lines.extend(_segment_branches(
+            i, rs, options, mask_label=mask_labels.get(i),
+        ))
 
     n = len(render_segments)
     concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(n))
@@ -454,6 +523,93 @@ def load_segments(segments_json: Path) -> list[Segment]:
     return out
 
 
+def _encoder_cmd_flags(options: RenderOptions) -> list[str]:
+    """Video encoder CLI flags — HEVC needs a `tag:v hvc1` for Apple
+    ecosystem compatibility; libx264 / h264_videotoolbox skip the tag."""
+    enc = options.video_encoder
+    flags = ["-c:v", enc, "-b:v", options.video_bitrate]
+    if enc.startswith("hevc"):
+        flags += ["-tag:v", "hvc1"]
+    elif enc == "libx264":
+        # ultrafast gets the render done in reasonable wall time on CPU;
+        # quality loss is marginal at 12M bitrate and fine for a pipeline
+        # where Stage F (polish) re-encodes audio and remuxes anyway.
+        flags += ["-preset", "ultrafast"]
+    flags += ["-pix_fmt", options.pix_fmt]
+    return flags
+
+
+def _render_single_pass(
+    screen: Path,
+    webcam: Path,
+    audio_source: Path,
+    rsegs: list[RenderSegment],
+    output: Path,
+    options: RenderOptions,
+) -> None:
+    """Build one filter graph covering `rsegs` and run a single ffmpeg
+    invocation that writes `output`. Keeps intermediate files (the filter
+    script) around on failure so the graph can be inspected.
+    """
+    fc = build_filter_complex(rsegs, options)
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False, dir=output.parent
+    ) as tf:
+        tf.write(fc)
+        script_path = Path(tf.name)
+
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+        "-i", str(screen),
+        "-i", str(webcam),
+        "-i", str(audio_source),
+        "-filter_complex_script", str(script_path),
+        "-map", "[vout]", "-map", "[aout]",
+        *_encoder_cmd_flags(options),
+        "-c:a", "aac",
+        "-b:a", options.audio_bitrate,
+        "-ar", str(options.audio_sample_rate),
+        # Force constant-FPS output so small timestamp drift from speed
+        # ramps (setpts / atempo rounding) doesn't wedge the muxer. Also
+        # raise the muxing queue ceiling generously.
+        "-fps_mode", "cfr",
+        "-r", str(options.output_fps),
+        "-max_muxing_queue_size", "9999",
+        "-movflags", "+faststart",
+        str(output),
+    ]
+    log.info("ffmpeg cmd: %s", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+
+def _concat_chunks_copy(chunks: list[Path], output: Path) -> None:
+    """Stitch rendered chunks into `output` via the concat demuxer with
+    `-c copy` — no re-encoding, so it's fast and byte-identical per chunk.
+
+    Paths in the list file are resolved to absolute so ffmpeg's concat
+    demuxer — which resolves relative paths against the LIST FILE's
+    directory, NOT the current working directory — can find the chunks
+    regardless of where ffmpeg was invoked from.
+    """
+    listing = "\n".join(f"file '{p.resolve()}'" for p in chunks) + "\n"
+    list_file = output.parent / f".concat_{output.stem}.txt"
+    list_file.write_text(listing)
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+            "-f", "concat", "-safe", "0",
+            "-i", str(list_file),
+            "-c", "copy",
+            "-movflags", "+faststart",
+            str(output),
+        ]
+        log.info("concat chunks: %s", " ".join(cmd))
+        subprocess.run(cmd, check=True)
+    finally:
+        list_file.unlink(missing_ok=True)
+
+
 def render(
     screen: Path,
     webcam: Path,
@@ -463,6 +619,11 @@ def render(
     options: RenderOptions | None = None,
 ) -> None:
     """Build filter graph, write to temp script, invoke ffmpeg.
+
+    On long content (many segments) this chunks the render into batches
+    of `options.chunk_size` and concat-copies the results — keeps the
+    filter graph per-ffmpeg-invocation small enough that the muxer queue
+    doesn't pile up.
 
     Inputs (3 files; audio_source often == webcam or a separate merged file):
       -i screen     → [0]
@@ -479,37 +640,48 @@ def render(
             log.warning("ffprobe failed; using default resolutions (%s)", e)
 
     rsegs = split_at_zoom_boundaries(segments)
-    fc = build_filter_complex(rsegs, options)
+    n = len(rsegs)
+    cs = options.chunk_size
+    # Single-pass path: either chunking is disabled or the render fits
+    # comfortably in one graph.
+    if cs <= 0 or n <= cs:
+        _render_single_pass(screen, webcam, audio_source, rsegs, output, options)
+        return
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".txt", delete=False, dir=output.parent
-    ) as tf:
-        tf.write(fc)
-        script_path = Path(tf.name)
-
+    # Chunked path: render each batch to its own mp4, then concat-copy.
+    batches = [rsegs[i : i + cs] for i in range(0, n, cs)]
+    print(
+        f"[render] chunking: {n} segments → {len(batches)} batches "
+        f"of up to {cs}",
+        flush=True,
+    )
+    chunk_files: list[Path] = []
     try:
-        cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-            "-i", str(screen),
-            "-i", str(webcam),
-            "-i", str(audio_source),
-            "-filter_complex_script", str(script_path),
-            "-map", "[vout]", "-map", "[aout]",
-            "-c:v", "hevc_videotoolbox",
-            "-b:v", options.video_bitrate,
-            "-tag:v", "hvc1",
-            "-pix_fmt", options.pix_fmt,
-            "-c:a", "aac",
-            "-b:a", options.audio_bitrate,
-            "-ar", str(options.audio_sample_rate),
-            "-movflags", "+faststart",
-            str(output),
-        ]
-        log.info("ffmpeg cmd: %s", " ".join(cmd))
-        subprocess.run(cmd, check=True)
-    finally:
-        # Keep the script around on failure for debugging
-        pass
+        for bi, batch in enumerate(batches):
+            cf = output.parent / f"_chunk_{output.stem}_{bi:03d}.mp4"
+            print(
+                f"[render] chunk {bi + 1}/{len(batches)}: "
+                f"{len(batch)} segments → {cf.name}",
+                flush=True,
+            )
+            _render_single_pass(screen, webcam, audio_source, batch, cf, options)
+            chunk_files.append(cf)
+        print(f"[render] concat {len(chunk_files)} chunks → {output.name}", flush=True)
+        _concat_chunks_copy(chunk_files, output)
+    except Exception:
+        # Keep chunk files on failure so the user can inspect or manually
+        # resume from a known-good chunk. Successful renders clean up in
+        # the `else` block below.
+        log.error(
+            "render failed — keeping %d chunk files under %s for inspection",
+            len(chunk_files), output.parent,
+        )
+        raise
+    else:
+        # Only cleanup chunks after a successful concat — they can sum to
+        # many GB. Filter scripts (tmp*.txt) always remain for debugging.
+        for cf in chunk_files:
+            cf.unlink(missing_ok=True)
 
 
 def run(args: argparse.Namespace) -> int:
