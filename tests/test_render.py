@@ -15,10 +15,12 @@ from pathlib import Path
 import pytest
 
 from src.stages.render import (
+    DEFAULT_EASE_DUR_S,
     RenderOptions,
     RenderSegment,
     atempo_chain,
     build_filter_complex,
+    smooth_zoom_crop_filter,
     split_at_zoom_boundaries,
     zoom_crop_filter,
 )
@@ -96,6 +98,118 @@ def test_zoom_crop_filter_right_edge_clamps() -> None:
     out = zoom_crop_filter(z, 1920, 1080)
     # Clamped crop_x = 1920 - 960 = 960; crop_y = 1080 - 540 = 540
     assert "crop=960.000:540.000:960.000:540.000" == out
+
+
+# --- smooth_zoom_crop_filter ------------------------------------------
+
+def test_smooth_zoom_returns_scale_crop_chain() -> None:
+    z = Z(0, 5, cx=0.5, cy=0.5, zoom=1.5)
+    out = smooth_zoom_crop_filter(z, 1920, 1080, local_duration=5.0)
+    # Must be a scale-then-crop chain (crop alone can't do time-varying size).
+    assert out.startswith("scale=")
+    assert ",crop=" in out
+    # Scale must be frame-evaluated for the zoom factor to change over time.
+    assert "eval=frame" in out
+
+
+def test_smooth_zoom_includes_hermite_cubic_terms() -> None:
+    z = Z(0, 3, cx=0.5, cy=0.5, zoom=1.5)
+    out = smooth_zoom_crop_filter(z, 1920, 1080, local_duration=3.0)
+    # Cubic Hermite smoothstep: 3u^2 - 2u^3 for both ease-in and ease-out.
+    assert "3*pow(clip(t/" in out
+    assert "2*pow(clip(t/" in out
+    # Ease-out half of the smoothstep uses (L - t).
+    assert "(3-t)" in out
+
+
+def test_smooth_zoom_includes_clip_for_edge_safety() -> None:
+    """Crop position must never leave the scaled image bounds."""
+    z = Z(0, 3, cx=0.5, cy=0.5, zoom=1.5)
+    out = smooth_zoom_crop_filter(z, 1920, 1080, local_duration=3.0)
+    # x/y are clamped to [0, scaled - out_dim] via clip().
+    assert "clip(0.5*iw-1920/2,0,iw-1920)" in out
+    assert "clip(0.5*ih-1080/2,0,ih-1080)" in out
+
+
+def test_smooth_zoom_references_time_variable_t() -> None:
+    z = Z(0, 4, cx=0.5, cy=0.5, zoom=1.5)
+    out = smooth_zoom_crop_filter(z, 1920, 1080, local_duration=4.0)
+    # The scale expression must use `t` (per-frame timestamp).
+    assert "t/" in out
+
+
+def test_smooth_zoom_crop_output_dims_match_input() -> None:
+    """Crop must output (in_w × in_h) so downstream filters see a stable
+    frame size. The math is: scale up by z(t), then crop back down to
+    (in_w × in_h) centered on the cursor.
+    """
+    z = Z(0, 3, cx=0.5, cy=0.5, zoom=1.5)
+    out = smooth_zoom_crop_filter(z, 1920, 1080, local_duration=3.0)
+    assert "crop=w=1920:h=1080:" in out
+
+
+def test_smooth_zoom_custom_ease_dur_appears_in_string() -> None:
+    z = Z(0, 5, cx=0.5, cy=0.5, zoom=1.5)
+    out_default = smooth_zoom_crop_filter(z, 1920, 1080, local_duration=5.0)
+    out_fast = smooth_zoom_crop_filter(
+        z, 1920, 1080, local_duration=5.0, ease_dur=0.15
+    )
+    # The two should produce different strings — the ease duration shows up
+    # in the expression literally.
+    assert out_default != out_fast
+    assert "0.15" in out_fast
+    assert "0.35" in out_default
+
+
+def test_smooth_zoom_uses_local_duration_for_ease_out_term() -> None:
+    """The ease-out half of the smoothstep references `(L - t)` where L
+    is the local_duration — NOT the original segment length.
+    """
+    z = Z(0, 12, cx=0.5, cy=0.5, zoom=1.5)
+    out = smooth_zoom_crop_filter(z, 1920, 1080, local_duration=2.5)
+    # Literal 2.5 must appear in the (L-t) subexpression.
+    assert "(2.5-t)" in out
+    # Original end (12) should not appear (it'd mean we passed the wrong L).
+    assert "(12-t)" not in out
+
+
+def test_smooth_zoom_default_ease_dur_exported_constant() -> None:
+    """The DEFAULT_EASE_DUR_S constant must be the value used when the
+    caller doesn't pass an ease_dur — keeps the public API stable.
+    """
+    assert DEFAULT_EASE_DUR_S == 0.35
+    z = Z(0, 5, cx=0.5, cy=0.5, zoom=1.5)
+    out_default = smooth_zoom_crop_filter(z, 1920, 1080, local_duration=5.0)
+    out_explicit = smooth_zoom_crop_filter(
+        z, 1920, 1080, local_duration=5.0, ease_dur=DEFAULT_EASE_DUR_S,
+    )
+    assert out_default == out_explicit
+
+
+def test_smooth_zoom_off_center_cursor_coords_in_expr() -> None:
+    """Non-centered cx/cy values must appear in the crop offset math."""
+    z = Z(0, 3, cx=0.25, cy=0.8, zoom=1.8)
+    out = smooth_zoom_crop_filter(z, 2560, 1440, local_duration=3.0)
+    assert "0.25*iw" in out
+    assert "0.8*ih" in out
+    # 1.8 is the zoom factor and must show up in the z(t) expression.
+    assert "1.8" in out
+
+
+def test_smooth_zoom_identity_when_target_zoom_is_one() -> None:
+    """Documents the `zoom=1.0` edge case.
+
+    With target_zoom=1, `z(t) = 1 + (1-1)*step = 1` — the scale is a no-op
+    and crop is centered at 0,0 with full dimensions — effectively identity.
+    This is correct but wasteful; higher-level code avoids emitting zooms
+    of zoom=1 in the first place (cursor_zoom.py emits zoom=1.5).
+    """
+    z = Z(0, 3, cx=0.5, cy=0.5, zoom=1.0)
+    out = smooth_zoom_crop_filter(z, 1920, 1080, local_duration=3.0)
+    # Still a scale,crop chain (we don't special-case zoom=1).
+    assert out.startswith("scale=")
+    # The factor (Z-1) = 0 is still present, proving math is consistent.
+    assert "(1-1)*" in out
 
 
 # --- split_at_zoom_boundaries -----------------------------------------
@@ -212,8 +326,28 @@ def test_build_filter_zoom_adds_crop() -> None:
     )]
     opts = RenderOptions(screen_res=(1920, 1080))
     fc = build_filter_complex(rs, opts)
-    assert "[s0_trim]crop=" in fc
+    # The smooth zoom emits a scale,crop chain between [s0_trim] and [s0_crop].
+    assert "[s0_trim]scale=" in fc
+    assert ",crop=" in fc
     assert "[s0_crop]" in fc
+    # And the expression must contain the Hermite + time-base markers.
+    assert "3*pow(clip(t/" in fc
+    assert "eval=frame" in fc
+
+
+def test_build_filter_zoom_uses_local_duration_under_speed_ramp() -> None:
+    """With speed=4x, a 10-s source zoom runs 2.5 s in local (post-setpts)
+    time. The smooth zoom's ease curves should use that local duration,
+    not the original 10 s — otherwise at high speed the ease-in/out would
+    overshoot the visible segment duration.
+    """
+    rs = [RenderSegment(
+        start=0, end=10, speed=4.0, layout="screen_full",
+        zoom=Z(0, 10, cx=0.5, cy=0.5, zoom=1.5),
+    )]
+    fc = build_filter_complex(rs, RenderOptions())
+    # 10/4 = 2.5 — this numeric literal must appear in the ease-out term.
+    assert "(2.5-t)" in fc
 
 
 def test_build_filter_zoom_skipped_when_layout_cam_full() -> None:
@@ -315,3 +449,72 @@ def test_filter_parses_with_ffmpeg(tmp_path: Path) -> None:
         f"ffmpeg rejected the filter graph:\n{r.stderr}\n\nscript:\n{fc}"
     )
     assert (tmp_path / "out.mp4").exists()
+
+
+@pytest.mark.slow
+def test_smooth_zoom_ease_visibly_changes_frames(tmp_path: Path) -> None:
+    """Render a 4-s screen_full segment with a centered zoom over the whole
+    range, then extract frames at t=0 (pre-ease, zoom≈1) and t=0.35/2
+    (mid-ease, zoom≈midway). Assert the frames differ in SHA — the crop
+    window slid / the scale factor changed, so the visible pixels should
+    not be byte-identical.
+
+    Uses `testsrc2` (ffmpeg's built-in gradient + timecode pattern) so any
+    change in crop position or zoom level shows up in the frame content.
+    """
+    import hashlib
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not on PATH")
+
+    rs = [
+        RenderSegment(
+            start=0, end=4, speed=1.0, layout="screen_full",
+            zoom=Z(0, 4, cx=0.3, cy=0.6, zoom=1.8),
+        ),
+    ]
+    fc = build_filter_complex(rs, RenderOptions())
+    script = tmp_path / "fc.txt"
+    script.write_text(fc)
+
+    # Use testsrc2 as the screen input — its timecode + gradient makes
+    # crop-region changes obvious in the pixel data.
+    out = tmp_path / "out.mp4"
+    cmd = [
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc2=s=2560x1440:r=30:d=6",
+        "-f", "lavfi", "-i", "color=c=red:s=1920x1080:r=30:d=6",
+        "-f", "lavfi", "-i", "sine=frequency=220:duration=6",
+        "-filter_complex_script", str(script),
+        "-map", "[vout]", "-map", "[aout]",
+        "-c:v", "libx264", "-preset", "ultrafast",
+        "-c:a", "aac",
+        str(out),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    assert r.returncode == 0, f"ffmpeg failed:\n{r.stderr}"
+
+    def _frame_hash(t: float) -> str:
+        p = tmp_path / f"frame_{int(t*1000):04d}.png"
+        r2 = subprocess.run(
+            [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+             "-ss", f"{t:.3f}", "-i", str(out),
+             "-frames:v", "1", str(p)],
+            capture_output=True, text=True,
+        )
+        assert r2.returncode == 0, f"frame extract failed at t={t}: {r2.stderr}"
+        return hashlib.sha1(p.read_bytes()).hexdigest()
+
+    # t=0: pre-ease, zoom=1 → full frame visible.
+    # t=0.2: inside ease-in (ease_dur=0.35) → zoom ~partial.
+    # t=2.0: inside the hold plateau → full zoom.
+    h_start = _frame_hash(0.0)
+    h_mid_ease = _frame_hash(0.2)
+    h_hold = _frame_hash(2.0)
+    assert h_start != h_mid_ease, (
+        "start and mid-ease frames are byte-identical — zoom didn't animate."
+    )
+    assert h_mid_ease != h_hold, (
+        "mid-ease and hold frames are identical — ease curve never reached "
+        "the full-zoom plateau."
+    )

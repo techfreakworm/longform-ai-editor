@@ -150,12 +150,21 @@ def atempo_chain(speed: float, eps: float = 1e-6) -> list[str]:
 
 # ---------- zoom crop ------------------------------------------------
 
+# Default ease-in/ease-out duration (seconds) for the Hermite smoothstep.
+# 350 ms feels natural — not a snap, not a lazy slide. Can be overridden.
+DEFAULT_EASE_DUR_S: float = 0.35
+
+
 def zoom_crop_filter(zoom: ZoomWindow, in_w: int, in_h: int) -> str:
     """Build a static ffmpeg `crop=...` for the given zoom window.
 
     Crops a (in_w/zoom × in_h/zoom) region centered at (cx*in_w, cy*in_h),
     clamped to the source bounds. The caller scales the cropped result
     back up to the output resolution.
+
+    Retained as a utility for tests and simple non-animated use cases.
+    Production rendering uses `smooth_zoom_crop_filter` which adds ease
+    in/out so the zoom doesn't snap visually.
     """
     crop_w = in_w / zoom.zoom
     crop_h = in_h / zoom.zoom
@@ -164,6 +173,83 @@ def zoom_crop_filter(zoom: ZoomWindow, in_w: int, in_h: int) -> str:
     crop_x = max(0.0, min(in_w - crop_w, crop_x))
     crop_y = max(0.0, min(in_h - crop_h, crop_y))
     return f"crop={crop_w:.3f}:{crop_h:.3f}:{crop_x:.3f}:{crop_y:.3f}"
+
+
+def smooth_zoom_crop_filter(
+    zoom: ZoomWindow,
+    in_w: int,
+    in_h: int,
+    local_duration: float,
+    ease_dur: float = DEFAULT_EASE_DUR_S,
+) -> str:
+    """Time-varying zoom filter with cubic-Hermite ease-in / hold / ease-out.
+
+    Returns a `scale=...,crop=...` filter chain (as a single string) that
+    smoothly zooms into the cursor over `ease_dur` seconds, holds at full
+    zoom, then zooms back out over `ease_dur` seconds — all covering the
+    range [0, local_duration] in local (post-trim, post-setpts) time.
+
+    Why scale+crop instead of a single time-varying crop:
+      ffmpeg's `crop` filter only re-evaluates `x`/`y` per frame — the
+      output dimensions `w`/`h` are fixed at init time. So a crop whose
+      *size* changes per frame is not possible with that filter alone.
+      Workaround: upscale the input per frame by z(t) using `scale` with
+      `eval=frame`, then center-crop a fixed (in_w × in_h) window from
+      the scaled image, with x/y panning to keep the cursor framed.
+
+    Math (`t` = local segment time, `D` = ease_dur, `L` = local_duration,
+    `Z` = target_zoom, `CX`/`CY` = normalized cursor position):
+        u_in  = clip(t/D, 0, 1)
+        u_out = clip((L-t)/D, 0, 1)
+        step  = min(3*u_in^2 - 2*u_in^3, 3*u_out^2 - 2*u_out^3)   # 0..1
+        z(t)  = 1 + (Z-1) * step
+        scaled_w = in_w * z(t);  scaled_h = in_h * z(t)
+        crop_x = clip(CX*scaled_w - in_w/2, 0, scaled_w - in_w)
+        crop_y = clip(CY*scaled_h - in_h/2, 0, scaled_h - in_h)
+
+    The crop output is always (in_w × in_h), matching the scale's input
+    — so downstream filters see a stable frame size.
+
+    Escaping notes:
+      - We emit this filter into a `-filter_complex_script` file, so
+        shell-level escaping isn't needed.
+      - Filter-graph colons and commas inside expressions MUST be single-
+        quoted (`'...'`), otherwise ffmpeg splits on them. Hence every
+        expression below is wrapped in single quotes.
+      - Commas INSIDE an expression (e.g. `clip(a,b,c)`) stay unescaped
+        because they're within a single-quoted string. No backslashes
+        needed — those are only for quoting-style command-line usage.
+    """
+    z = zoom.zoom
+    cx, cy = zoom.cx, zoom.cy
+    d = ease_dur
+    L = local_duration
+
+    # The smoothstep expression. Computed symbolically so the string is
+    # readable + auditable. `t` here is the ffmpeg per-frame timestamp
+    # (seconds since the filter started processing frames — which, after
+    # setpts=(PTS-STARTPTS)/speed, is local segment time).
+    u_in = f"clip(t/{d:g},0,1)"
+    u_out = f"clip(({L:g}-t)/{d:g},0,1)"
+    hermite_in = f"(3*pow({u_in},2)-2*pow({u_in},3))"
+    hermite_out = f"(3*pow({u_out},2)-2*pow({u_out},3))"
+    step = f"min({hermite_in},{hermite_out})"
+    z_expr = f"(1+({z:g}-1)*{step})"
+
+    # scale output dimensions (time-varying).
+    scale_w = f"{in_w}*{z_expr}"
+    scale_h = f"{in_h}*{z_expr}"
+
+    # crop window: fixed in_w × in_h from the scaled image, centered on
+    # the cursor and edge-clamped. Inside crop, `iw`/`ih` are the scaled
+    # input's current dimensions (i.e. in_w * z(t) / in_h * z(t)).
+    crop_x = f"clip({cx:g}*iw-{in_w}/2,0,iw-{in_w})"
+    crop_y = f"clip({cy:g}*ih-{in_h}/2,0,ih-{in_h})"
+
+    return (
+        f"scale=w='{scale_w}':h='{scale_h}':eval=frame:flags=bicubic,"
+        f"crop=w={in_w}:h={in_h}:x='{crop_x}':y='{crop_y}'"
+    )
 
 
 # ---------- filter graph builder -------------------------------------
@@ -200,8 +286,14 @@ def _segment_branches(i: int, rs: RenderSegment, opts: RenderOptions) -> list[st
             f"setpts=(PTS-STARTPTS){pts_divisor}[s{i}_trim]"
         )
         if rs.zoom is not None:
+            # local_duration: time axis seen by filters AFTER the /speed
+            # divisor in setpts=(PTS-STARTPTS)/speed. The smooth zoom's
+            # ease curves run in this local timebase.
+            local_duration = (rs.end - rs.start) / rs.speed
             lines.append(
-                f"[s{i}_trim]{zoom_crop_filter(rs.zoom, *opts.screen_res)}[s{i}_crop]"
+                f"[s{i}_trim]"
+                f"{smooth_zoom_crop_filter(rs.zoom, *opts.screen_res, local_duration)}"
+                f"[s{i}_crop]"
             )
             s_branch = f"s{i}_crop"
         else:
@@ -376,8 +468,10 @@ def run(args: argparse.Namespace) -> int:
 __all__ = [
     "RenderSegment",
     "RenderOptions",
+    "DEFAULT_EASE_DUR_S",
     "atempo_chain",
     "zoom_crop_filter",
+    "smooth_zoom_crop_filter",
     "split_at_zoom_boundaries",
     "build_filter_complex",
     "load_segments",
