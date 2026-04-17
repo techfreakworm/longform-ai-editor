@@ -73,6 +73,15 @@ class ZoomSegment:
     cy: float          # normalized centroid y in [0, 1]
 
 
+# Speech-emphasis zoom tuning. Strength maps to zoom magnification and
+# factors into merge rules downstream.
+SPEECH_ZOOM_BY_STRENGTH = {
+    "soft": 1.25,
+    "normal": 1.5,
+    "strong": 1.7,
+}
+
+
 # --- Parse --------------------------------------------------------------
 
 def parse_cursor_csv(
@@ -272,6 +281,82 @@ def compute_centroid(
 
 # --- Top-level entry ----------------------------------------------------
 
+def _cursor_position_at(
+    moves: list[CursorEvent], t: float
+) -> tuple[float, float] | None:
+    """Return the cursor position closest to time `t` from the moves list.
+
+    Returns None if moves is empty or `t` is before the first move
+    timestamp minus 0.5 s (no reasonable estimate available).
+    """
+    if not moves:
+        return None
+    nearest = min(moves, key=lambda m: abs(m.t_s - t))
+    if abs(nearest.t_s - t) > 0.5 and t < nearest.t_s:
+        return None
+    return (nearest.x, nearest.y)
+
+
+def zoom_segments_from_hints(
+    hints: list[dict],
+    moves: list[CursorEvent],
+    duration_s: float,
+) -> list[ZoomSegment]:
+    """Convert LLM ZoomHint entries into ZoomSegments in video timebase.
+
+    Centroid resolution priority:
+      1. Cursor position at `start` (via nearest move event, ±0.5 s) if
+         cursor data is available.
+      2. Screen center (0.5, 0.5) if no cursor data.
+
+    Magnification comes from SPEECH_ZOOM_BY_STRENGTH (1.25 / 1.5 / 1.7).
+
+    Args:
+        hints: list of dicts {start, end, strength, ...}. Accepts dicts
+            rather than a typed ZoomHint so callers don't need to import
+            pydantic models.
+        moves: cursor move events in CSV timebase. These should already
+            be shifted into video timebase by the caller if a sync
+            offset applies.
+        duration_s: clip duration, used to clamp hint windows.
+    """
+    segs: list[ZoomSegment] = []
+    for h in hints:
+        start = max(0.0, float(h["start"]))
+        end = min(duration_s, float(h["end"]))
+        if end <= start:
+            continue
+        strength = h.get("strength", "normal")
+        zoom = SPEECH_ZOOM_BY_STRENGTH.get(strength, AUTO_ZOOM_AMOUNT)
+        pos = _cursor_position_at(moves, start)
+        cx, cy = pos if pos is not None else (0.5, 0.5)
+        segs.append(ZoomSegment(start=start, end=end, zoom=zoom, cx=cx, cy=cy))
+    return segs
+
+
+def merge_zoom_segments(
+    a: list[ZoomSegment], b: list[ZoomSegment]
+) -> list[ZoomSegment]:
+    """Merge two zoom-segment lists, dropping b-entries that overlap a.
+
+    Cursor-driven zooms (a) take precedence — they already have precise
+    centroids and a validated duration. LLM-driven speech-emphasis zooms
+    (b) fill gaps where the cursor didn't move.
+
+    Overlap rule: if an LLM hint's midpoint falls inside any cursor zoom,
+    the hint is dropped (cursor zoom already covers it). Otherwise the
+    hint is kept as-is.
+    """
+    result = list(a)
+    for h in b:
+        mid = 0.5 * (h.start + h.end)
+        overlaps = any(z.start <= mid <= z.end for z in a)
+        if not overlaps:
+            result.append(h)
+    result.sort(key=lambda z: z.start)
+    return result
+
+
 def generate_zoom_segments(
     csv_path: Path,
     screen_w: int,
@@ -348,4 +433,8 @@ __all__ = [
     "filter_short",
     "compute_centroid",
     "generate_zoom_segments",
+    "SPEECH_ZOOM_BY_STRENGTH",
+    "zoom_segments_from_hints",
+    "merge_zoom_segments",
+    "_cursor_position_at",
 ]

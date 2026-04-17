@@ -301,6 +301,80 @@ def test_call_via_claude_cli_nonzero_exit_raises(claude_enabled) -> None:
             _call_via_claude_cli("sys", {})
 
 
+def test_call_via_claude_cli_passes_effort_flag(claude_enabled) -> None:
+    """The CLI command includes `--effort` set to config.CLAUDE_EFFORT (default 'max')."""
+    from src import config
+    with patch("src.stages.analyze_llm.subprocess.run",
+               return_value=_mock_completed_process('{"ok": 1}')) as m:
+        _call_via_claude_cli("sys", {})
+    cmd = m.call_args[0][0]
+    assert "--effort" in cmd
+    i = cmd.index("--effort")
+    assert cmd[i + 1] == config.CLAUDE_EFFORT
+
+
+def test_call_via_claude_cli_passes_mcp_config_when_file_exists(
+    claude_enabled, monkeypatch, tmp_path
+) -> None:
+    """When USE_SEQUENTIAL_THINKING is on and .mcp.json exists, `--mcp-config` is passed."""
+    from src import config
+    mcp_file = tmp_path / ".mcp.json"
+    mcp_file.write_text("{}")
+    monkeypatch.setattr(config, "USE_SEQUENTIAL_THINKING", True)
+    monkeypatch.setattr(config, "CLAUDE_MCP_CONFIG", mcp_file)
+    with patch("src.stages.analyze_llm.subprocess.run",
+               return_value=_mock_completed_process('{"ok": 1}')) as m:
+        _call_via_claude_cli("sys", {})
+    cmd = m.call_args[0][0]
+    assert "--mcp-config" in cmd
+    i = cmd.index("--mcp-config")
+    assert cmd[i + 1] == str(mcp_file)
+
+
+def test_call_via_claude_cli_omits_mcp_config_when_disabled(
+    claude_enabled, monkeypatch, tmp_path
+) -> None:
+    """When USE_SEQUENTIAL_THINKING is off, `--mcp-config` is NOT passed."""
+    from src import config
+    mcp_file = tmp_path / ".mcp.json"
+    mcp_file.write_text("{}")
+    monkeypatch.setattr(config, "USE_SEQUENTIAL_THINKING", False)
+    monkeypatch.setattr(config, "CLAUDE_MCP_CONFIG", mcp_file)
+    with patch("src.stages.analyze_llm.subprocess.run",
+               return_value=_mock_completed_process('{"ok": 1}')) as m:
+        _call_via_claude_cli("sys", {})
+    cmd = m.call_args[0][0]
+    assert "--mcp-config" not in cmd
+
+
+def test_call_via_claude_cli_prepends_sequential_thinking_prefix(
+    claude_enabled, monkeypatch,
+) -> None:
+    """The stdin payload includes SEQUENTIAL_THINKING_PREFIX when the flag is on."""
+    from src import config
+    monkeypatch.setattr(config, "USE_SEQUENTIAL_THINKING", True)
+    with patch("src.stages.analyze_llm.subprocess.run",
+               return_value=_mock_completed_process('{"ok": 1}')) as m:
+        _call_via_claude_cli("ORIGINAL_SYS_PROMPT", {})
+    stdin = m.call_args.kwargs["input"]
+    assert config.SEQUENTIAL_THINKING_PREFIX.strip() in stdin
+    assert "ORIGINAL_SYS_PROMPT" in stdin
+
+
+def test_call_via_claude_cli_omits_prefix_when_disabled(
+    claude_enabled, monkeypatch,
+) -> None:
+    """When USE_SEQUENTIAL_THINKING is off, the prefix is absent from stdin."""
+    from src import config
+    monkeypatch.setattr(config, "USE_SEQUENTIAL_THINKING", False)
+    with patch("src.stages.analyze_llm.subprocess.run",
+               return_value=_mock_completed_process('{"ok": 1}')) as m:
+        _call_via_claude_cli("ORIGINAL_SYS_PROMPT", {})
+    stdin = m.call_args.kwargs["input"]
+    assert config.SEQUENTIAL_THINKING_PREFIX.strip() not in stdin
+    assert "ORIGINAL_SYS_PROMPT" in stdin
+
+
 # --- Dispatcher logic -------------------------------------------------
 
 def test_dispatcher_prefers_claude_when_available(claude_enabled) -> None:

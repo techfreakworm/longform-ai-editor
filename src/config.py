@@ -49,6 +49,29 @@ FORCE_LOCAL_LLM = os.getenv("FORCE_LOCAL_LLM", "").lower() in {"1", "true", "yes
 # the latest Opus; "sonnet" to the latest Sonnet. Full IDs also accepted
 # (e.g. "claude-opus-4-7").
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "opus")
+# Reasoning effort level passed to `claude --effort`. Valid values per
+# `claude --help`: low, medium, high, xhigh, max. Default = max so the
+# layout/filler/scoring calls get full thinking budget.
+CLAUDE_EFFORT = os.getenv("CLAUDE_EFFORT", "max")
+# When true, prompts are prefixed with an instruction to invoke the
+# `sequentialthinking` MCP tool before answering. Requires the
+# sequential-thinking MCP server to be configured (see .mcp.json at
+# repo root). Disable for fast test iteration or when MCP is unavailable.
+USE_SEQUENTIAL_THINKING = os.getenv("USE_SEQUENTIAL_THINKING", "1").lower() in {"1", "true", "yes"}
+# Path to the .mcp.json this project should load for `claude -p` calls.
+# Falls back to the repo-root .mcp.json.
+_MCP_CONFIG_DEFAULT = Path(__file__).resolve().parent.parent / ".mcp.json"
+CLAUDE_MCP_CONFIG = Path(os.getenv("CLAUDE_MCP_CONFIG", _MCP_CONFIG_DEFAULT))
+
+# Prompt prefix injected when USE_SEQUENTIAL_THINKING is true. Kept
+# short — the MCP server itself guides the multi-step reasoning format.
+SEQUENTIAL_THINKING_PREFIX = (
+    "Before producing your final JSON answer, use the "
+    "`sequentialthinking` MCP tool to break down the analysis into "
+    "explicit reasoning steps. Reason about edge cases, check the "
+    "quantitative rules in this prompt against the input, and only "
+    "then emit the final JSON.\n\n"
+)
 
 # ----- Transcription ----------------------------------------------------
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "mlx-community/whisper-large-v3-turbo")
@@ -65,6 +88,29 @@ MOTION_WIDTH = _i("MOTION_WIDTH", 400)
 # ----- Dead-zone classification ----------------------------------------
 CUT_MIN_SEC = _f("CUT_MIN_SEC", 10.0)
 SPEED_8X_MIN_SEC = _f("SPEED_8X_MIN_SEC", 3.0)
+
+# ----- Face visibility + cursor idle (triple-intersection hard-cut) ----
+# Any window where face absent AND narration silent AND cursor idle
+# becomes a hard cut, regardless of length. Covers "stepped away from
+# the computer" footage that passed neither dead-zone nor silence alone.
+FACE_SAMPLE_RATE_HZ = _f("FACE_SAMPLE_RATE_HZ", 2.0)   # Apple Vision sample rate
+FACE_ABSENT_MIN_SEC = _f("FACE_ABSENT_MIN_SEC", 2.0)   # min continuous absence
+CURSOR_IDLE_MIN_SEC = _f("CURSOR_IDLE_MIN_SEC", 2.0)   # min no-move window
+
+# ----- Zoom v2 ---------------------------------------------------------
+# Element-aware zoom target snapping (paddleocr required). When on,
+# zoom centroids are snapped to the nearest OCR'd UI element if within
+# ELEMENT_SNAP_MAX_PX. Off by default — install extras with
+# `pip install '.[zoom-ocr]'` and set USE_ELEMENT_AWARE_ZOOM=1.
+USE_ELEMENT_AWARE_ZOOM = os.getenv("USE_ELEMENT_AWARE_ZOOM", "").lower() in {"1", "true", "yes"}
+ELEMENT_SNAP_MAX_PX = _f("ELEMENT_SNAP_MAX_PX", 150.0)
+
+# Zoom-on-scroll / window-change: frame-diff during cursor-idle windows.
+# When enough pixels change and the cursor hasn't moved, emit a zoom
+# centered on the change region. Off by default — opt-in per pipeline.
+USE_SCROLL_ZOOM = os.getenv("USE_SCROLL_ZOOM", "").lower() in {"1", "true", "yes"}
+SCROLL_ZOOM_SAMPLE_RATE_HZ = _f("SCROLL_ZOOM_SAMPLE_RATE_HZ", 2.0)
+SCROLL_ZOOM_DIFF_THRESHOLD = _f("SCROLL_ZOOM_DIFF_THRESHOLD", 0.04)  # 4% of pixels
 
 # ----- Render ----------------------------------------------------------
 VIDEO_BITRATE = os.getenv("VIDEO_BITRATE", "12M")
@@ -233,6 +279,88 @@ Return strict JSON covering [0, total_duration_s] contiguously:
 {"segments": [
   {"start": 0.0,  "end": 12.3, "layout": "cam_full"},
   {"start": 12.3, "end": 48.0, "layout": "pip"},
+  ...
+]}
+"""
+
+SHORTFORM_SCORING_PROMPT = """You score candidate clips cut from a longer
+tutorial / podcast for "hook potential" on YouTube Shorts, Reels, and TikTok.
+
+Input: one candidate clip window as a JSON object with:
+  - start, end: seconds in source timebase
+  - transcript: the words spoken in this window
+
+Output a JSON object with:
+  - score: 0.0 – 10.0 (decimal). 10 = stop-the-scroll viral-quality
+    hook. 0 = forgettable middle of an explainer.
+  - title: 6 – 10 words, hook-style, no clickbait. Examples:
+      "How I replaced my editor with Claude CLI"
+      "The tiny prompt that cut my bugs in half"
+      "Why I stopped writing unit tests myself"
+  - reason: one sentence justifying the score.
+  - start_offset: seconds to trim from the CLIP START for fluency
+    (e.g. if the window opens mid-filler, drop that). 0 if clean.
+  - end_offset: seconds to trim from the CLIP END for fluency.
+
+Scoring rubric (apply silently, don't echo it):
+  - Hook: does the first 3s pose a question, state a surprise, or
+    promise a payoff?
+  - Clarity: can a viewer with zero context follow the 30 s?
+  - Self-contained: complete thought, no dangling references.
+  - Emotion / stakes: any conflict, revelation, or counterintuitive
+    twist?
+  - Demo moment: does the presenter verbally point at something on
+    screen ("look at this", "here's where …")? Those shine on mobile.
+
+Return strict JSON:
+{"score": 7.5, "title": "Why I stopped writing unit tests myself",
+ "reason": "opens with a provocative claim, 30s self-contained, payoff at end",
+ "start_offset": 0.0, "end_offset": 0.0}
+"""
+
+ZOOM_HINTS_PROMPT = """You are an editor for a screen-recording tutorial.
+Identify moments where the presenter verbally points the viewer AT
+something on the screen. Those are zoom opportunities — the screen
+will punch in during those phrases so the viewer can read what the
+narrator is referring to.
+
+Input: word-level transcript with start/end timestamps.
+
+Flag a zoom when the narrator uses deictic phrases like:
+  - "look at this", "look here", "look right here"
+  - "right here", "over here", "see this", "see here"
+  - "notice this", "notice that", "notice how"
+  - "check this out", "you can see"
+  - "this part", "this line", "this button"
+  - "pay attention to", "focus on"
+
+Output a ZoomHint per phrase with:
+  - anchor_word_idx: 0-based index of the TRIGGER word (e.g. "this" in
+    "look at THIS"). The subsequent 2–4 seconds are typically the
+    narrator elaborating on the target, so the zoom should extend
+    forward, not backward.
+  - start, end: seconds — the zoom window. Start at the trigger word's
+    start timestamp. End 2.5–4 s after, or at the next natural clause
+    break (comma/period), whichever is shorter.
+  - strength: "soft" | "normal" | "strong"
+      soft    — weak verbal hint ("you can see", "this")
+      normal  — typical deictic ("look at this", "right here")
+      strong  — explicit attention command ("pay attention to", "notice how")
+  - reason: short phrase explaining the cue.
+
+Quality rules:
+  - Do NOT flag generic "this" pronouns in ordinary sentences. Require
+    a verbal POINTING pattern, not just the word "this".
+  - Do NOT flag in the intro/outro (first 10s or last 10s) — the
+    layout is cam_full there, zoom is ignored anyway.
+  - Aim for 2–5 zooms per minute of screen-demo content.
+  - Skip if trigger phrase is immediately followed by > 2 s of silence
+    (Whisper probably mis-timed it).
+
+Return strict JSON:
+{"hints": [
+  {"anchor_word_idx": 42, "start": 18.3, "end": 21.1,
+   "strength": "normal", "reason": "look at this"},
   ...
 ]}
 """

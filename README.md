@@ -1,34 +1,51 @@
 # long-form-editor
 
-**100%-local dual-track long-form YouTube editor for Apple Silicon.**
+**100%-local dual-track long-form + shortform YouTube editor for Apple Silicon.**
 No cloud credits, no per-render fees, no SaaS. Runs on your machine end-to-end.
 
 ```
 OBS session (ext.mov + cam.mov + merged.mp4 [+ cursor.csv])
                          ↓
-   ┌────────────────────────────────────────────────────┐
-   │ sync → transcribe+LLM → dead-zone detect → unify   │
-   │      → render (chunked) → polish (loudnorm)        │
-   └────────────────────────────────────────────────────┘
+   ┌──────────────────────────────────────────────────────────────┐
+   │ sync → transcribe → LLM (filler + layout + zoom hints)       │
+   │      → dead-zone detect → face-visibility → unify            │
+   │      → render (chunked) → polish (loudnorm)                  │
+   └──────────────────────────────────────────────────────────────┘
                          ↓
                      final.mp4   (1920×1080, HEVC, EBU R128)
+                         │
+                         │ optional
+                         ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │ shortform: transcribe → topical segment → LLM score + rank   │
+   │          → reframe (face + cursor) → karaoke captions        │
+   │          → render (4 layouts, 9:16 portrait)                 │
+   └──────────────────────────────────────────────────────────────┘
+                         ↓
+                     N × 1080×1920 HEVC shorts
 ```
 
 ---
 
 ## What it actually does (real measurements)
 
-**Short clip** (95.75 s test session, M5 Max): polished **42.99 s** 1920×1080 HEVC
-in **7.6 s of render wall-clock**. 47 words transcribed, 7 filler cuts, 5 layout
-sections, 3 dead zones, webcam composited as PIP over the screen, speed ramps
-via `setpts` + pitch-preserving `atempo`.
+**Short clip** (95.75 s test session, M5 Max): polished **44.8 s** 1920×1080 HEVC
+in ~8 s of render wall-clock. Pipeline now also invokes Claude CLI with
+`--effort max` + sequential-thinking MCP — 3 LLM calls (filler / layout /
+zoom hints) take ~60 s total on a clip this small.
 
-**Long clip** (34.7 min stitched from a 3-session recording, M5 Max): polished
-**27:58** 1920×1080 HEVC in ~6 min render wall-clock. 3386 words transcribed,
-7 filler cuts, 6 layout sections, 84 dead zones → 173 segments (117 PIP with
-circle mask, 52 screen-full, 4 cam-full; 42 at 8× speed, 35 at 4×). Rendered in
-6 chunks of ≤30 segments each and stream-copy-concatenated at the end (see
-[Why chunked rendering](#why-chunked-rendering)).
+**Long clip** (34.7 min stitched 3-session recording, M5 Max): polished
+**27:59** 1920×1080 HEVC, **29 min wall-clock total**. 3664 words transcribed
+(~60 s via mlx-whisper on GPU), Claude CLI LLM phase with MCP `~15 min`
+(6 filler cuts + 14 layout segments + **9 zoom hints**), face-visibility
+detected 51 absence intervals, 84 dead zones → 179 segments rendered in
+7 chunks of ≤30 each + concat-demuxer stitch.
+
+**Shortform run** (same 34.7-min stitched clip → 3 portrait shorts): total
+**~50 min** first run, 2–3 min on re-runs (ranked-cache). Scoring 17
+candidates via Claude CLI `--effort max` is the long leg at ~14 min;
+face-crop + 3 renders ~2 min combined. Output: 3 × **1080×1920 HEVC**
+(23–34 s each) with karaoke captions burned in.
 
 | Stage | Role | Status | Tests |
 |---|---|---|---|
@@ -36,13 +53,19 @@ circle mask, 52 screen-full, 4 cam-full; 42 at 8× speed, 35 at 4×). Rendered i
 | M0b · cursor tracker | record-time cursor/click/clap log | ✅ | — |
 | M1 · Stage A sync | clap-cue alignment, CSV ↔ video time | ✅ | 18 |
 | cursor_zoom (Cap port) | AGPL algorithm port for auto-zoom | ✅ | 22 |
-| M2 · Stage B transcribe + LLM | mlx-whisper + Llama 3.3 / Claude CLI | ✅ | 33 |
-| M3 · Stage C dead-zone detect | freezedetect + silencedetect intersection | ✅ | 32 |
-| M4 · Stage D unify segments | merge all decisions → canonical edit list | ✅ | 46 |
-| M5 · Stage E render | chunked ffmpeg filter_complex + concat demuxer | ✅ | 56 |
-| M6 · Stage F polish | optional DeepFilterNet denoise + EBU R128 loudnorm | ✅ | 10 |
+| M2 · Stage B transcribe + LLM | mlx-whisper + Claude CLI (effort=max + MCP) | ✅ | 38 |
+| zoom v2 — speech-emphasis | LLM-driven "look at this" zoom markers | ✅ | 19 |
+| zoom v2 — element-aware OCR | paddleocr snap to UI elements (opt-in) | ✅ | 9 |
+| zoom v2 — zoom-on-scroll | frame-diff zoom during cursor idle (opt-in) | ✅ | 12 |
+| M3 · Stage C dead-zone detect | freeze ∩ silence + silence side-artifact | ✅ | 32 |
+| Stage C.2 — face visibility | Apple Vision face absence detection | ✅ | 7 |
+| cursor-idle intervals | CSV → no-move windows for triple-intersect | ✅ | 8 |
+| M4 · Stage D unify | merge + triple-intersection hard-cut | ✅ | 53 |
+| M5 · Stage E render | chunked filter_complex + circle PIP | ✅ | 56 |
+| M6 · Stage F polish | EBU R128 loudnorm + optional denoise | ✅ | 10 |
+| **Shortform v1** | portrait 9:16 pipeline (4 layouts) | ✅ | 88 |
 
-**208 fast tests + 11 slow integration tests** (real ffmpeg / LLM / fixtures).
+**369 fast tests + 11 slow integration tests** (real ffmpeg / LLM / fixtures).
 
 ---
 
@@ -104,11 +127,12 @@ Record your tutorial. When done:
 
 ### LLM backend — Claude CLI (preferred) or local MLX
 
-The filler-cuts + layout-plan LLM calls auto-dispatch based on what's available:
+All long-form + shortform LLM calls (filler cuts, layout plan, zoom hints,
+shortform scoring) auto-dispatch based on what's available:
 
 | Condition | Backend |
 |---|---|
-| `claude` on PATH AND `FORCE_LOCAL_LLM` not set | Claude Code CLI (uses your `claude login`) |
+| `claude` on PATH AND `FORCE_LOCAL_LLM` not set | Claude Code CLI (`claude -p --effort max --mcp-config .mcp.json`) |
 | Claude unavailable OR `FORCE_LOCAL_LLM=1` | Local `mlx_lm.server` |
 
 For the **local** path, start the server in a separate terminal (~60 s to load
@@ -121,6 +145,19 @@ mlx_lm.server --model mlx-community/Llama-3.3-70B-Instruct-4bit --port 8080
 
 For the **Claude** path, just make sure `claude -p --help` works — no server
 needed. Calls count toward your Claude Max/Pro subscription.
+
+### `--effort max` + sequential-thinking MCP
+
+When Claude CLI is used, the dispatcher passes `--effort max` (highest
+thinking budget) and loads `.mcp.json` at the repo root, which declares
+the sequential-thinking MCP server. Prompts get a prefix instructing
+Claude to use the `sequentialthinking` tool before answering — meaningful
+quality lift on layout and zoom-hint decisions at zero marginal cost for
+Claude Max/Pro subscribers.
+
+Gate with `USE_SEQUENTIAL_THINKING=0` if you want faster turnaround or
+your `.mcp.json` isn't set up. `CLAUDE_EFFORT` overrides the effort level.
+See `.env.example` for the full set of knobs.
 
 ### One-command run
 
@@ -235,6 +272,72 @@ done
 
 Then run the pipeline on the stitched files.
 
+## Shortform (portrait 9:16) pipeline
+
+After a long-form render, you can pull portrait clips out of the same
+source (or out of the composited `final.mp4`) for YouTube Shorts /
+Reels / TikTok:
+
+```bash
+# Install the optional deps (~1.5 GB extras, first time):
+#   parakeet-mlx, mediapipe, scenedetect, stable-ts,
+#   sentence-transformers, ultralytics, OneEuroFilter
+pip install -e '.[shortform]'
+
+# Dual-track input (preferred — enables per-clip layout picks):
+python -m src.cli shortform \
+    --screen ext.mov --webcam cam.mov --audio merged.mp4 \
+    --cursor ~/sessions/episode_01.csv \
+    --top 3 --min-sec 30 --max-sec 60
+
+# OR single-source (already-composited mp4):
+python -m src.cli shortform --composited final.mp4 --top 3
+```
+
+**Pipeline stages** (all inside `src/shortform/`):
+
+1. **Transcribe** — parakeet-mlx (CC-BY-4.0, ~110× realtime) if installed,
+   else mlx-whisper fallback. Emits word-level timestamps + sentence
+   boundaries.
+2. **Topical segment** — multi-scale TextTiling on sentence-transformers
+   `all-roberta-large-v1` embeddings across 8 window sizes. Produces
+   candidate clips at topic boundaries. Falls back to 60 s fixed chunks
+   if sentence-transformers isn't installed.
+3. **Score + rank** — Claude CLI (`--effort max` + MCP) per candidate
+   returns `{score, title, reason, start_offset, end_offset}`; composite
+   with audio-energy / punctuation / length heuristics picks top-N.
+   Results cached to `shortform_ranked.json` for fast re-runs.
+4. **Reframe** — OpenCV Haar cascade per-scene face centroid (webcam) +
+   cursor-activity centroid (screen) + OneEuroFilter smoothing. Falls
+   back to `PIP_FACE_X/Y` + screen-center when no face / cursor.
+5. **Captions** — stable-ts karaoke ASS when installed, else a
+   pure-Python ASS writer with the same style (Montserrat ExtraBold,
+   yellow sweep, bottom-center, hand-wrapped to ~18 chars/line).
+6. **Render** — per-layout ffmpeg filter graph:
+   - `cam_full` — webcam fills 1080×1920
+   - `screen_full` — screen-only, cursor-centered 9:16 crop
+   - `split_vstack` — screen top + webcam face bottom (TikTok style); the
+     screen portion is **pre-zoomed** (default 1.6×) so code / UI remains
+     legible at phone size
+   - `pip` — screen main with circular webcam inset bottom-right
+
+Layout is heuristically picked per clip from transcript cues ("look at",
+"notice", "here's the thing", …). Default `split_vstack` unless the
+clip has purely narrative cues (goes `cam_full`) or no webcam track
+(goes `screen_full`).
+
+### Shortform known issues
+
+- **Cursor-less sources degrade quality.** Without `cursor.csv`, screen
+  crops default to center — UI off-center in the 16:9 source gets
+  cropped out of `split_vstack`'s top half. Several upgrade paths
+  documented in `docs/future-improvements.md §0`. Record with the cursor
+  tracker if you care about shortform output on screen content.
+- **Scoring time scales with candidate count** (~50 s/clip at
+  `--effort max`). Pipeline pre-filters by duration to drop obvious
+  non-candidates before LLM cost. See `docs/future-improvements.md §9`
+  for further optimization paths.
+
 ## Circle PIP (webcam bubble) and face offset
 
 By default the webcam is composited as a **circular talking-head bubble** over
@@ -255,6 +358,46 @@ Environment tunables (or override in `.env`):
 If you sit to the left of frame, try `PIP_FACE_X=0.35`; to the right, `0.65`.
 See [`docs/future-improvements.md`](docs/future-improvements.md) for the
 auto-detection roadmap (Apple Vision / mediapipe / InsightFace options).
+
+## Zoom v2 — three signals feeding cursor-zoom
+
+Cursor-driven click/move zooms were v1. Three additional signals can
+emit `ZoomSegment`s that merge into the cursor stream:
+
+| Signal | How it fires | Default | Enable |
+|---|---|---|---|
+| **Speech-emphasis** | LLM parses transcript for deictic cues ("look at this", "right here", "notice", …) and returns anchored (start, end, strength) windows. Centroid = cursor position at hint start when cursor CSV exists, else screen center. | ON | Via `analyze_zoom_hints` (runs in Stage B). Disable by emptying `work/zoom_hints.json`. |
+| **Element-aware OCR snap** | After cursor centroids are computed, paddleocr is run on the frame; if the nearest UI text block is within `ELEMENT_SNAP_MAX_PX` (150 px default), the centroid snaps to that element's midpoint. | OFF | `USE_ELEMENT_AWARE_ZOOM=1` + `pip install '.[zoom-ocr]'` |
+| **Zoom-on-scroll** | During cursor-idle windows on the screen track, frame-diff (pixel absdiff thresholded) detects new content appearing. If the changed region is ≥ `SCROLL_ZOOM_DIFF_THRESHOLD` (default 4%) of the frame, emit a zoom centered on the change bbox. | OFF | `USE_SCROLL_ZOOM=1` |
+
+All three are gated behind env vars so the default pipeline stays
+predictable. Speech-emphasis is on by default because its LLM call has
+no local compute cost.
+
+## Face-visibility + triple-intersection hard-cut
+
+Stage C.2 (`src/stages/face_visibility.py`) samples the webcam at
+`FACE_SAMPLE_RATE_HZ` (2 Hz default) through Apple Vision
+`VNDetectFaceRectanglesRequest` via PyObjC. Emits `work/face_absent.json`
+with contiguous intervals ≥ `FACE_ABSENT_MIN_SEC` where no face was
+detected.
+
+Stage D (`src/stages/unify_segments.py`) intersects three signals:
+
+- **Face absent** (≥ 2 s)
+- **Cursor idle** (`src/stages/cursor_idle.py`, ≥ 2 s no movements)
+- **Narration silent** (`silence_intervals.json` side-artifact from
+  Stage C)
+
+Where all three agree, the range becomes a **hard cut regardless of
+length** — catches "stepped away from the computer" footage that
+freeze+silence alone wouldn't.
+
+**The triple-intersection is dormant when any source is missing** —
+specifically, no `cursor.csv` ⇒ no cursor-idle source ⇒ no triple cuts.
+By design: two-out-of-three agreement isn't strong enough evidence.
+If you're running on old recordings, use the existing dead-zone
+speed-ramp / cut pipeline (works unchanged).
 
 ## Why chunked rendering
 
@@ -407,6 +550,19 @@ artifacts to force a re-run of that stage.
   CapSoftware/Cap's Rust source. If you commercialize this pipeline, the
   cursor-zoom component is AGPL — either re-implement the algorithm from
   the documented constants alone or pay Cap's commercial license.
+- **Ultralytics YOLO11 is AGPL-3.0** (only used if installed via
+  `[shortform]` extras; YOLO-based person-detection code paths aren't
+  in reframe.py at the moment — shortform uses Haar cascade). Fine for
+  personal use; swap for RT-DETR / YOLOX before commercializing.
+- **Shortform quality on cursor-less sources** is visibly worse than on
+  sources with `cursor.csv`. Screen crops default to center; triple-
+  intersection stays dormant; speech-emphasis zoom centroids fall back
+  to screen center. Four upgrade paths tracked in
+  `docs/future-improvements.md §0` — ship activity-centered crop first.
+- **Shortform scoring is slow at `--effort max`.** ~50 s per candidate,
+  and a 34-min source produces ~17 candidates after the duration
+  pre-filter ⇒ ~14 min scoring pass. Ranked-cache speeds up re-runs.
+  Further optimizations in `docs/future-improvements.md §9`.
 
 ---
 
@@ -434,33 +590,58 @@ long-form-editor/
 │   ├── requirements.txt
 │   └── README.md
 ├── src/
-│   ├── cli.py                      # argparse entry: sync|analyze|detect-dead|unify|render|polish|run|verify
-│   ├── config.py                   # paths, thresholds, prompts, PIP knobs (env-overridable)
-│   ├── pipeline.py                 # run_all orchestrator
-│   ├── stages/
+│   ├── cli.py                      # argparse entry: sync|analyze|detect-dead|unify|render|polish|run|shortform|verify
+│   ├── config.py                   # paths, thresholds, prompts, PIP knobs, --effort, MCP, face/cursor/zoom (env-overridable)
+│   ├── pipeline.py                 # run_all orchestrator (A → F + C.2 face-visibility)
+│   ├── stages/                     # long-form stages
 │   │   ├── sync_clap.py            # Stage A
-│   │   ├── transcribe.py           # Stage B.1
-│   │   ├── analyze_llm.py          # Stage B.2 (Claude CLI + MLX server dispatcher)
-│   │   ├── dead_zone_detect.py     # Stage C
-│   │   ├── unify_segments.py       # Stage D
+│   │   ├── transcribe.py           # Stage B.1 (+ analyze dispatch)
+│   │   ├── analyze_llm.py          # Stage B.2 — Claude CLI (--effort + MCP) / MLX dispatcher, zoom_hints schema
+│   │   ├── dead_zone_detect.py     # Stage C + silence_intervals side-artifact
+│   │   ├── face_visibility.py      # Stage C.2 — Apple Vision face absence detection
+│   │   ├── cursor_idle.py          # helper for triple-intersection
+│   │   ├── unify_segments.py       # Stage D + triple-intersection hard-cut + speech zoom merge
+│   │   ├── element_aware.py        # zoom v2 OCR snap (opt-in)
+│   │   ├── scroll_zoom.py          # zoom v2 frame-diff (opt-in)
+│   │   ├── cursor_zoom.py          # Cap algorithm port + speech-emphasis zoom merge
 │   │   ├── render.py               # Stage E (chunked + circle PIP + smooth zoom)
-│   │   ├── polish.py               # Stage F (loudnorm, optional denoise)
-│   │   └── cursor_zoom.py          # Cap algorithm port
+│   │   └── polish.py               # Stage F (loudnorm, optional denoise)
+│   ├── shortform/                  # Portrait 9:16 subpackage (v1 2026-04-18)
+│   │   ├── __init__.py
+│   │   ├── transcribe.py           # parakeet-mlx → mlx-whisper fallback
+│   │   ├── segment.py              # multi-scale TextTiling
+│   │   ├── score.py                # Claude-CLI + composite heuristics + ranked cache
+│   │   ├── reframe.py              # Haar face crops + PySceneDetect + OneEuroFilter
+│   │   ├── captions.py             # stable-ts karaoke + pure-Python ASS fallback
+│   │   ├── render.py               # 4 layouts, ffmpeg filter_complex builder
+│   │   └── pipeline.py             # orchestrator + layout picker + slug
 │   └── utils/
-│       ├── ffmpeg_helpers.py       # subprocess, ffprobe wrappers
-│       ├── log_parsers.py          # freezedetect/silencedetect regex
-│       └── timecodes.py            # seconds ↔ frames + interval math
+│       ├── ffmpeg_helpers.py
+│       ├── log_parsers.py
+│       └── timecodes.py
 └── tests/
     ├── fixtures/real/              # symlinks to real OBS fixtures (gitignored)
     ├── test_sync.py                # 18
-    ├── test_analyze_llm.py         # 33
+    ├── test_analyze_llm.py         # 38
     ├── test_transcribe.py          # 12
     ├── test_dead_zone_detect.py    # 19
-    ├── test_unify_segments.py      # 46
+    ├── test_unify_segments.py      # 53
     ├── test_render.py              # 56
     ├── test_cursor_zoom.py         # 22
+    ├── test_cursor_idle.py         # 8
+    ├── test_face_visibility.py     # 7
+    ├── test_zoom_v2_speech.py      # 19
+    ├── test_zoom_v2_element.py     # 9
+    ├── test_zoom_v2_scroll.py      # 12
     ├── test_log_parsers.py         # 8
-    └── test_timecodes.py           # 8
+    ├── test_timecodes.py           # 8
+    └── shortform/                  # 88 tests
+        ├── test_segment.py         # 15
+        ├── test_score.py           # 16
+        ├── test_reframe.py         # 15
+        ├── test_captions.py        # 12
+        ├── test_render.py          # 16
+        └── test_pipeline.py        # 14
 ```
 
 ---

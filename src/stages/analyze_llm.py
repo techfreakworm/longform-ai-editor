@@ -57,6 +57,21 @@ class LayoutPlanResponse(BaseModel):
     segments: list[LayoutSegment]
 
 
+ZoomStrength = Literal["soft", "normal", "strong"]
+
+
+class ZoomHint(BaseModel):
+    anchor_word_idx: int
+    start: float
+    end: float
+    strength: ZoomStrength = "normal"
+    reason: str = ""
+
+
+class ZoomHintsResponse(BaseModel):
+    hints: list[ZoomHint] = Field(default_factory=list)
+
+
 # --- helpers ----------------------------------------------------------
 
 THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -104,6 +119,18 @@ def _have_claude_cli() -> bool:
     return shutil.which("claude") is not None
 
 
+def _maybe_prepend_sequential_thinking(system_prompt: str) -> str:
+    """Prepend the sequential-thinking MCP instruction when enabled.
+
+    Gated by config.USE_SEQUENTIAL_THINKING so tests and environments
+    without the MCP server configured (check `.mcp.json` at repo root)
+    can disable it cleanly.
+    """
+    if config.USE_SEQUENTIAL_THINKING:
+        return config.SEQUENTIAL_THINKING_PREFIX + system_prompt
+    return system_prompt
+
+
 def _call_via_claude_cli(
     system_prompt: str,
     user_payload: dict[str, Any],
@@ -121,12 +148,18 @@ def _call_via_claude_cli(
     Uses the user's existing `claude login` session (Claude Max/Pro
     subscription) — no API key needed, calls count toward subscription
     quota rather than per-token billing.
+
+    Passes `--effort <level>` (default "max") so Claude applies full
+    reasoning budget to each call. Also passes `--mcp-config` so the
+    non-interactive session can reach the sequential-thinking MCP
+    declared in the project's .mcp.json — without this, `claude -p`
+    only sees MCP servers from ~/.claude.json global config.
     """
     model = model or config.CLAUDE_MODEL
     timeout_s = timeout_s or config.LLM_TIMEOUT_SEC
 
     prompt_body = (
-        system_prompt.rstrip()
+        _maybe_prepend_sequential_thinking(system_prompt).rstrip()
         + _JSON_INSTRUCTION_SUFFIX
         + "\n\nInput:\n"
         + _json.dumps(user_payload)
@@ -134,10 +167,13 @@ def _call_via_claude_cli(
     cmd = [
         "claude", "-p",
         "--model", model,
+        "--effort", config.CLAUDE_EFFORT,
         "--output-format", "text",
         "--permission-mode", "bypassPermissions",
         "--no-session-persistence",
     ]
+    if config.USE_SEQUENTIAL_THINKING and config.CLAUDE_MCP_CONFIG.exists():
+        cmd.extend(["--mcp-config", str(config.CLAUDE_MCP_CONFIG)])
     log.debug("calling claude CLI: %s", cmd)
     r = subprocess.run(
         cmd,
@@ -176,7 +212,10 @@ def _call_via_mlx_server(
     model = model or config.LLM_MODEL
     timeout_s = timeout_s or config.LLM_TIMEOUT_SEC
 
-    system_with_json = system_prompt.rstrip() + _JSON_INSTRUCTION_SUFFIX
+    system_with_json = (
+        _maybe_prepend_sequential_thinking(system_prompt).rstrip()
+        + _JSON_INSTRUCTION_SUFFIX
+    )
     payload = {
         "model": model,
         "temperature": temperature,
@@ -321,6 +360,29 @@ def _fill_coverage_gaps(
     wait=wait_fixed(1),
     reraise=True,
 )
+def analyze_zoom_hints(words: list[dict[str, Any]]) -> ZoomHintsResponse:
+    """LLM identifies deictic zoom moments ("look at this", "notice", ...).
+
+    The LLM emits windows in video timebase (words' own timestamps) along
+    with a strength. Downstream: unify_segments merges these with
+    cursor-driven zoom segments, using cursor position at hint start as
+    the zoom centroid when cursor.csv is available, else screen center.
+
+    Retries up to config.LLM_MAX_RETRIES on schema validation failure.
+    """
+    raw = call_llm_json(config.ZOOM_HINTS_PROMPT, {"words": words})
+    try:
+        return ZoomHintsResponse(**raw)
+    except ValidationError as e:
+        log.warning("zoom_hints response failed schema: %s — retrying", e)
+        raise
+
+
+@retry(
+    stop=stop_after_attempt(config.LLM_MAX_RETRIES),
+    wait=wait_fixed(1),
+    reraise=True,
+)
 def analyze_layout(
     words: list[dict[str, Any]],
     total_duration: float,
@@ -349,7 +411,12 @@ __all__ = [
     "Layout",
     "LayoutSegment",
     "LayoutPlanResponse",
+    "ZoomStrength",
+    "ZoomHint",
+    "ZoomHintsResponse",
+    "analyze_zoom_hints",
     "strip_thinking",
+    "_maybe_prepend_sequential_thinking",
     "_have_claude_cli",
     "_call_via_claude_cli",
     "_call_via_mlx_server",

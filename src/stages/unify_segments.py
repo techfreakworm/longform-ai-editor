@@ -45,7 +45,16 @@ from pathlib import Path
 from typing import Literal
 
 from src import config
-from src.stages.cursor_zoom import ZoomSegment, generate_zoom_segments
+from src.stages.cursor_idle import detect_cursor_idle_intervals
+from src.stages.cursor_zoom import (
+    CursorEvent,
+    ZoomSegment,
+    generate_zoom_segments,
+    merge_zoom_segments,
+    parse_cursor_csv,
+    zoom_segments_from_hints,
+)
+from src.stages.dead_zone_detect import intersect_intervals
 
 log = logging.getLogger(__name__)
 
@@ -123,6 +132,65 @@ def load_dead_zones(path: Path) -> list[tuple[float, float, str]]:
     data = json.loads(path.read_text())
     zones = data.get("zones", []) or data.get("dead_zones", [])
     return [(float(z["start"]), float(z["end"]), z["action"]) for z in zones]
+
+
+def load_zoom_hints(path: Path) -> list[dict]:
+    """Load zoom_hints.json from analyze stage (speech-emphasis zooms).
+
+    Returns list of dicts — caller passes them straight to
+    `zoom_segments_from_hints`. Missing file or malformed entries degrade
+    silently to an empty list.
+    """
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return []
+    hints = data.get("hints", []) or []
+    return [h for h in hints if "start" in h and "end" in h]
+
+
+def load_face_absent(path: Path) -> list[tuple[float, float]]:
+    """Load face_absent.json from face_visibility stage.
+
+    Returns list of (start, end) in CAM TIMEBASE. Since cam/ext/audio
+    are synced to the same T=0 after Stage A, these are equivalent to
+    video timebase as long as the webcam recording is the reference
+    (which it is — sync.json.csv_to_video_offset_s is keyed to cam).
+    """
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text())
+    return [(float(a["start"]), float(a["end"])) for a in data.get("absences", [])]
+
+
+def load_silence_intervals(path: Path) -> list[tuple[float, float]]:
+    """Load the raw silencedetect output side-artifact from dead_zone_detect."""
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text())
+    return [(float(x["start"]), float(x["end"])) for x in data.get("intervals", [])]
+
+
+def compute_triple_intersection_cuts(
+    face_absent: list[tuple[float, float]],
+    cursor_idle: list[tuple[float, float]],
+    narration_silent: list[tuple[float, float]],
+    min_duration: float = 2.0,
+) -> list[tuple[float, float]]:
+    """All three signals must simultaneously indicate inactivity.
+
+    Uses the sweep-line helper from dead_zone_detect with min_agree=3.
+    Returned intervals become hard-cut ranges regardless of length
+    (the render step never renders them).
+    """
+    ranges = intersect_intervals(
+        face_absent, cursor_idle, narration_silent,
+        min_agree=3,
+        min_duration=min_duration,
+    )
+    return [(s, e) for (s, e, _dets) in ranges]
 
 
 # ---------- core operations -------------------------------------------
@@ -377,6 +445,8 @@ def run(args: argparse.Namespace) -> int:
     layout_path = work_dir / "layout_plan.json"
     filler_path = work_dir / "filler_cuts.json"
     dead_path = work_dir / "dead_zones.json"
+    face_path = work_dir / "face_absent.json"
+    silence_path = work_dir / "silence_intervals.json"
     sync_path = work_dir / "sync.json"
     segments_path = work_dir / "segments.json"
 
@@ -388,12 +458,53 @@ def run(args: argparse.Namespace) -> int:
         timeline = apply_cuts(timeline, filler_cuts)
         timeline = merge_adjacent(timeline)
 
+        # Triple-intersection hard-cut: face absent ∩ cursor idle ∩ narration silent.
+        # All three sources optional — the intersection is meaningful only when
+        # all three are present. With any missing, falls through to just the
+        # existing dead-zone pipeline.
+        face_absent = load_face_absent(face_path)
+        silent = load_silence_intervals(silence_path)
+        cursor_csv: Path | None = getattr(args, "cursor", None)
+        cursor_idle: list[tuple[float, float]] = []
+        if cursor_csv is not None and cursor_csv.exists():
+            idle_intervals = detect_cursor_idle_intervals(
+                cursor_csv,
+                duration_s=source_duration,
+                min_idle_sec=config.CURSOR_IDLE_MIN_SEC,
+            )
+            # Shift cursor CSV timebase into video timebase if sync offset is known.
+            offset = 0.0
+            if sync_path.exists():
+                sync_data = json.loads(sync_path.read_text())
+                offset = float(sync_data.get("csv_to_video_offset_s") or 0.0)
+            cursor_idle = [
+                (iv.start + offset, iv.end + offset) for iv in idle_intervals
+            ]
+        if face_absent and cursor_idle and silent:
+            triple_cuts = compute_triple_intersection_cuts(
+                face_absent, cursor_idle, silent,
+                min_duration=max(
+                    config.FACE_ABSENT_MIN_SEC,
+                    config.CURSOR_IDLE_MIN_SEC,
+                    config.SILENCE_MIN_SEC,
+                ),
+            )
+            if triple_cuts:
+                print(
+                    f"[unify] triple-intersection hard-cuts: {len(triple_cuts)} "
+                    f"(face-absent ∩ cursor-idle ∩ narration-silent)"
+                )
+                timeline = apply_cuts(timeline, triple_cuts)
+                timeline = merge_adjacent(timeline)
+
         dead_zones = load_dead_zones(dead_path)
         timeline = apply_dead_zones(timeline, dead_zones)
         timeline = merge_adjacent(timeline)
 
-        # Optional cursor zoom
-        cursor_csv: Path | None = getattr(args, "cursor", None)
+        # Optional cursor zoom + speech-emphasis zoom hints
+        zoom_hints_path = work_dir / "zoom_hints.json"
+        zoom_hints = load_zoom_hints(zoom_hints_path)
+
         if cursor_csv is not None and cursor_csv.exists() and sync_path.exists():
             sync_data = json.loads(sync_path.read_text())
             offset = sync_data.get("csv_to_video_offset_s")
@@ -408,12 +519,81 @@ def run(args: argparse.Namespace) -> int:
                 screen_h = int(getattr(args, "screen_h", 1440))
                 origin_x = float(getattr(args, "origin_x", 0.0))
                 origin_y = float(getattr(args, "origin_y", 0.0))
-                zooms = generate_zoom_segments(
+                cursor_zooms = generate_zoom_segments(
                     cursor_csv, screen_w=screen_w, screen_h=screen_h,
                     duration_s=source_duration,
                     origin_x=origin_x, origin_y=origin_y,
                 )
-                timeline = annotate_cursor_zooms(timeline, zooms, offset)
+                # Speech-emphasis zooms: shift cursor moves into video
+                # time so the hint-centroid lookup works in the right
+                # frame. Hints themselves are already in video time.
+                _clicks, moves = parse_cursor_csv(
+                    cursor_csv, screen_w=screen_w, screen_h=screen_h,
+                    origin_x=origin_x, origin_y=origin_y,
+                )
+                moves_video = [
+                    CursorEvent(t_s=m.t_s + offset, x=m.x, y=m.y, is_click=False)
+                    for m in moves
+                ]
+                speech_zooms = zoom_segments_from_hints(
+                    zoom_hints, moves_video, source_duration,
+                )
+                # Cursor zooms are in CSV timebase; shift them into
+                # video time before merging.
+                cursor_zooms_video = [
+                    ZoomSegment(
+                        start=z.start + offset, end=z.end + offset,
+                        zoom=z.zoom, cx=z.cx, cy=z.cy,
+                    )
+                    for z in cursor_zooms
+                ]
+                merged_zooms = merge_zoom_segments(cursor_zooms_video, speech_zooms)
+
+                screen_path: Path | None = getattr(args, "screen", None)
+
+                # Optional scroll / window-change zoom: runs during
+                # cursor-idle windows against the screen track.
+                if (
+                    config.USE_SCROLL_ZOOM
+                    and screen_path is not None
+                    and screen_path.exists()
+                    and cursor_idle  # already shifted into video time above
+                ):
+                    from src.stages.scroll_zoom import detect_scroll_zooms
+                    scroll_zooms = detect_scroll_zooms(
+                        screen_path,
+                        cursor_idle,
+                        sample_rate_hz=config.SCROLL_ZOOM_SAMPLE_RATE_HZ,
+                        diff_threshold=config.SCROLL_ZOOM_DIFF_THRESHOLD,
+                    )
+                    if scroll_zooms:
+                        print(
+                            f"[unify] scroll_zoom found {len(scroll_zooms)} "
+                            f"content-change zooms"
+                        )
+                        merged_zooms = merge_zoom_segments(merged_zooms, scroll_zooms)
+
+                # Optional element-aware snap (paddleocr). Gated by env
+                # var so the expensive OCR pass is opt-in.
+                if (
+                    config.USE_ELEMENT_AWARE_ZOOM
+                    and screen_path is not None
+                    and screen_path.exists()
+                ):
+                    from src.stages.element_aware import snap_zoom_segments
+                    merged_zooms = snap_zoom_segments(
+                        merged_zooms, screen_path,
+                        frame_w=config.VIDEO_RES_W,
+                        frame_h=config.VIDEO_RES_H,
+                        max_distance_px=config.ELEMENT_SNAP_MAX_PX,
+                    )
+                # Already in video timebase — pass offset=0.0 to annotate.
+                timeline = annotate_cursor_zooms(timeline, merged_zooms, 0.0)
+        elif zoom_hints:
+            # No cursor.csv but we still have speech-emphasis hints —
+            # centroids default to screen center.
+            speech_zooms = zoom_segments_from_hints(zoom_hints, [], source_duration)
+            timeline = annotate_cursor_zooms(timeline, speech_zooms, 0.0)
 
         validate(timeline, source_duration)
 
@@ -445,6 +625,10 @@ __all__ = [
     "load_layout_plan",
     "load_cuts",
     "load_dead_zones",
+    "load_face_absent",
+    "load_silence_intervals",
+    "load_zoom_hints",
+    "compute_triple_intersection_cuts",
     "merge_adjacent",
     "subtract_range",
     "apply_cuts",

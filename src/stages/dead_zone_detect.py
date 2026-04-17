@@ -238,6 +238,18 @@ def run(args: argparse.Namespace) -> int:
             {"zones": [asdict(z) for z in zones]},
             indent=2,
         ))
+
+        # Side artifact for triple-intersection hard-cut in unify_segments —
+        # the raw silencedetect output without freeze intersection.
+        silence_path = work_dir / "silence_intervals.json"
+        silence_path.write_text(json.dumps(
+            {
+                "noise_db": silence_db,
+                "min_sec": silence_min,
+                "intervals": [{"start": s, "end": e} for s, e in silences],
+            },
+            indent=2,
+        ))
         print(
             f"[dead_zone] {len(zones)} merged dead zones "
             f"(cut={sum(1 for z in zones if z.action == 'cut')}, "

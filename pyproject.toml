@@ -35,6 +35,33 @@ dev = [
     "ruff>=0.5",
     "mypy>=1.10",
 ]
+# Shortform (portrait) pipeline extras — install via:
+#   pip install -e '.[shortform]'
+# YOLO11 ships under AGPL-3.0 — fine for personal/solo use. If this repo
+# ever becomes a hosted service, swap for RT-DETR or YOLOX.
+shortform = [
+    # Transcription — Parakeet TDT is ~110× realtime on M-class via MLX
+    "parakeet-mlx>=0.3",
+    # Person detection + tracking
+    "ultralytics>=8.4",
+    # Face landmarks
+    "mediapipe>=0.10.33",
+    # Scene boundaries
+    "scenedetect>=0.6.7",
+    # Centroid smoothing (adaptive low-pass filter for human motion)
+    "OneEuroFilter>=0.1",
+    # Topical segmentation embedder
+    "sentence-transformers>=3.0",
+    # Karaoke ASS generator
+    "stable-ts>=2.19",
+]
+# Element-aware zoom (long-form) — OCR for UI-element snapping.
+# Lives in a separate extra so long-form users who don't want OCR can
+# skip the ~300 MB PaddleOCR weight download.
+zoom-ocr = [
+    "paddleocr>=2.7",
+    "paddlepaddle>=2.6",
+]
 
 [project.scripts]
 lfe = "src.cli:main"

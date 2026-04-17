@@ -29,9 +29,12 @@ from src.stages.unify_segments import (
     annotate_cursor_zooms,
     apply_cuts,
     apply_dead_zones,
+    compute_triple_intersection_cuts,
     load_cuts,
     load_dead_zones,
+    load_face_absent,
     load_layout_plan,
+    load_silence_intervals,
     merge_adjacent,
     run,
     subtract_range,
@@ -533,3 +536,75 @@ def test_run_produces_valid_output(tmp_path: Path) -> None:
     # The cut at (105, 110) must leave a gap in the screen_full range
     sf_ranges = [(s.start, s.end) for s in segs if s.layout == "screen_full"]
     assert sf_ranges == [(100, 105), (110, 130)]
+
+
+# --- triple-intersection hard-cut ------------------------------------
+
+def test_triple_intersection_requires_all_three_sources() -> None:
+    """All three signals overlap on [5, 10] — that range is returned."""
+    out = compute_triple_intersection_cuts(
+        face_absent=[(0, 12)],
+        cursor_idle=[(5, 20)],
+        narration_silent=[(3, 10)],
+    )
+    assert out == [(5.0, 10.0)]
+
+
+def test_triple_intersection_two_signals_is_empty() -> None:
+    """Only two signals active → no triple-intersection output."""
+    out = compute_triple_intersection_cuts(
+        face_absent=[(0, 10)],
+        cursor_idle=[(0, 10)],
+        narration_silent=[],  # third source empty
+    )
+    assert out == []
+
+
+def test_triple_intersection_respects_min_duration() -> None:
+    """A 1.5 s triple overlap should be dropped under a 2 s threshold."""
+    out = compute_triple_intersection_cuts(
+        face_absent=[(5, 6.5)],
+        cursor_idle=[(5, 6.5)],
+        narration_silent=[(5, 6.5)],
+        min_duration=2.0,
+    )
+    assert out == []
+
+
+def test_triple_intersection_merges_disjoint_pieces() -> None:
+    """Two separate triple-overlap ranges both get emitted."""
+    out = compute_triple_intersection_cuts(
+        face_absent=[(0, 5), (10, 15)],
+        cursor_idle=[(0, 5), (10, 15)],
+        narration_silent=[(0, 5), (10, 15)],
+        min_duration=2.0,
+    )
+    assert out == [(0.0, 5.0), (10.0, 15.0)]
+
+
+def test_load_face_absent_reads_json(tmp_path) -> None:
+    p = tmp_path / "face_absent.json"
+    p.write_text(json.dumps({
+        "absences": [
+            {"start": 1.0, "end": 3.0},
+            {"start": 10.0, "end": 12.5},
+        ]
+    }))
+    assert load_face_absent(p) == [(1.0, 3.0), (10.0, 12.5)]
+
+
+def test_load_face_absent_missing_returns_empty(tmp_path) -> None:
+    assert load_face_absent(tmp_path / "nope.json") == []
+
+
+def test_load_silence_intervals_reads_json(tmp_path) -> None:
+    p = tmp_path / "silence_intervals.json"
+    p.write_text(json.dumps({
+        "intervals": [{"start": 2.0, "end": 4.0}]
+    }))
+    assert load_silence_intervals(p) == [(2.0, 4.0)]
+
+
+def test_load_silence_intervals_missing_returns_empty(tmp_path) -> None:
+    assert load_silence_intervals(tmp_path / "nope.json") == []
+

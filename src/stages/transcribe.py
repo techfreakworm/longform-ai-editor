@@ -123,35 +123,69 @@ def run_analyze(args: argparse.Namespace) -> int:
     words_path = work_dir / "words.json"
     filler_path = work_dir / "filler_cuts.json"
     layout_path = work_dir / "layout_plan.json"
+    zoom_hints_path = work_dir / "zoom_hints.json"
 
     try:
         # --- B.1 transcribe (with cache) ----------------------------
         cache_dir = work_dir / "transcribe_cache"
-        print(f"[analyze] transcribing audio: {audio.name}")
+        print(f"[analyze] transcribing audio: {audio.name}", flush=True)
         words = transcribe_and_cache(audio, config.WHISPER_MODEL, cache_dir)
         words_path.write_text(json.dumps({"words": words}, indent=2))
-        print(f"[analyze]   {len(words)} words → {words_path}")
+        print(f"[analyze]   {len(words)} words → {words_path}", flush=True)
 
         # --- B.2 LLM analysis ---------------------------------------
         # Imported lazily so CLI --help works without httpx/tenacity installed.
-        from src.stages.analyze_llm import analyze_fillers, analyze_layout
+        from src.stages.analyze_llm import (
+            analyze_fillers,
+            analyze_layout,
+            analyze_zoom_hints,
+        )
 
-        print(f"[analyze] calling LLM for filler cuts (model={config.LLM_MODEL})")
+        # Label the active LLM backend in logs so the "model=..." line
+        # doesn't mislead when Claude CLI is actually in use.
+        from src.stages.analyze_llm import _have_claude_cli
+        backend_label = (
+            f"claude ({config.CLAUDE_MODEL}, effort={config.CLAUDE_EFFORT})"
+            if (_have_claude_cli() and not config.FORCE_LOCAL_LLM)
+            else f"mlx ({config.LLM_MODEL})"
+        )
+
+        print(f"[analyze] calling LLM for filler cuts (backend={backend_label})",
+              flush=True)
         fillers = analyze_fillers(words)
         filler_path.write_text(json.dumps(
             {"cuts": [c.model_dump() for c in fillers.cuts]},
             indent=2,
         ))
-        print(f"[analyze]   {len(fillers.cuts)} filler cuts → {filler_path}")
+        print(f"[analyze]   {len(fillers.cuts)} filler cuts → {filler_path}",
+              flush=True)
 
         duration = probe_duration(audio)
-        print(f"[analyze] calling LLM for layout plan (duration={duration:.1f}s)")
+        print(f"[analyze] calling LLM for layout plan (duration={duration:.1f}s)",
+              flush=True)
         layout = analyze_layout(words, total_duration=duration)
         layout_path.write_text(json.dumps(
             {"segments": [s.model_dump() for s in layout.segments]},
             indent=2,
         ))
-        print(f"[analyze]   {len(layout.segments)} layout segments → {layout_path}")
+        print(f"[analyze]   {len(layout.segments)} layout segments → {layout_path}",
+              flush=True)
+
+        # Optional — zoom hints (speech-emphasis zooms). Failure here is
+        # non-fatal: if the LLM hiccups we still have cursor-driven zooms.
+        try:
+            print("[analyze] calling LLM for zoom hints", flush=True)
+            hints = analyze_zoom_hints(words)
+            zoom_hints_path.write_text(json.dumps(
+                {"hints": [h.model_dump() for h in hints.hints]},
+                indent=2,
+            ))
+            print(f"[analyze]   {len(hints.hints)} zoom hints → {zoom_hints_path}",
+                  flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[analyze] zoom hints failed (non-fatal): {exc}", flush=True)
+            # Write an empty hints file so downstream stages don't re-attempt.
+            zoom_hints_path.write_text(json.dumps({"hints": []}, indent=2))
         return 0
     except Exception as exc:  # noqa: BLE001
         print(f"[analyze] ERROR: {exc}", file=sys.stderr)

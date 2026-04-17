@@ -7,6 +7,56 @@ current feature set.
 
 ---
 
+## 0. Cursor-less clip quality (user-reported 2026-04-18)
+
+**Current state:** when a source recording has no `cursor.csv`, several
+high-value features fall back to neutral behavior:
+
+- **Triple-intersection hard-cut** is dormant (requires face-absent ∩
+  cursor-idle ∩ narration-silent; cursor-idle source is empty).
+- **Speech-emphasis zooms** still fire but cx/cy defaults to screen
+  center (0.5, 0.5) — they zoom into the middle of whatever's on screen
+  rather than the actual UI element being discussed.
+- **Element-aware OCR snap** still works when enabled, but has nothing
+  to snap FROM (the input centroid is already the screen center).
+- **Zoom-on-scroll** is dormant (requires cursor-idle windows).
+- **Shortform screen-crop** defaults to center for all scenes — split_vstack
+  ends up center-cropping screen content that was likely framed with the
+  action at a specific part of the 16:9 source.
+
+The output is **visibly worse** on cursor-less inputs. The 2026-04-17
+stitched clip run confirmed this: 3 shortform clips all picked
+`split_vstack` layout but the screen top-half was center-cropped, missing
+the actual UI elements.
+
+**Upgrade paths (pick one or combine):**
+
+1. **On-screen cursor tracking from the recording itself.** Run a
+   lightweight cursor detector (OpenCV template-matching against the macOS
+   arrow cursor sprite; or CoreGraphics `CGEventSourceGetEventMask` on a
+   captured screen stream) to reconstruct cursor.csv post-hoc. Medium
+   effort, high payoff.
+2. **Activity-centered screen crop as cursor fallback.** Re-use
+   `src/stages/scroll_zoom.py`'s frame-diff logic but on the whole video
+   (not just cursor-idle windows) to find the "most-active" region per
+   scene. Centroid of recent activity becomes the shortform screen crop.
+   Low effort, medium payoff.
+3. **OCR-driven screen crop.** Run `src/stages/element_aware.py`
+   periodically across the clip; the bounding box of the most prominent
+   non-chrome text block becomes the crop centroid. Works well for
+   code walkthroughs. Medium effort, high payoff for tutorial content
+   specifically.
+4. **LLM-driven screen-crop hints.** Add a prompt similar to zoom-hints
+   that asks the LLM to emit "on-screen-region-of-interest" per
+   sentence ("top-left terminal", "bottom-right button"), resolved
+   against a 3×3 grid. Cheap LLM call; degrades gracefully.
+
+Recommendation: ship **(2) activity-centered screen crop** first (shares
+almost all code with scroll_zoom), then layer **(3) OCR** on top for
+scenes where (2) yields a low-confidence centroid.
+
+---
+
 ## 1. Face-aware PIP positioning — auto-detect `cam_face_x/y`
 
 **Current state (2026-04-17):** `config.PIP_FACE_X` / `PIP_FACE_Y` are
@@ -131,3 +181,85 @@ may end up visually behind the PIP. Low priority because:
 
 If this bites, the fix is to penalize zooms whose final scaled center
 falls within a margin of the PIP rectangle — add to `cursor_zoom.py`.
+
+---
+
+## 6. Shortform: music bed + sidechain ducking
+
+**Deferred from v1 (2026-04-17).** Plan docs at
+`/Users/techfreakworm/Projects/editing/plans/short-form-pipeline.md`
+§7b.2 already sketch the filter graph. Add a `--music PATH` flag to the
+shortform CLI, duck under narration via `sidechaincompress=threshold=0.05:
+ratio=8:attack=5:release=300`, mix after loudnorm. +0.5 day work.
+
+---
+
+## 7. Shortform: Submagic-style animated caption templates
+
+**Deferred from v1 (2026-04-17).** Current shortform uses the pure-Python
+ASS karaoke writer (or stable-ts when installed) with fixed styling.
+Plan mentions rendering a transparent overlay via Remotion (Node) for
+animations beyond karaoke fills. Out of scope until we have real demand
+for per-template styling.
+
+Reference: AgriciDaniel/claude-shorts Remotion components, Aegisub
+override tags (`\fad`, `\t(0,200,\fscx120\fscy120)`).
+
+---
+
+## 8. Shortform: multi-speaker active-speaker detection
+
+**Deferred.** Mouth-aspect-ratio detection via MediaPipe Face Landmarker
+was in the plan but reframe.py ended up using OpenCV Haar cascade
+(mediapipe 0.10.x removed the `solutions` API). For solo creator content
+Haar is enough. For broadcast-grade ASD on multi-guest podcasts, add
+TalkNet-ASD (https://github.com/TaoRuijie/TalkNet-ASD) — significantly
+more compute + training data.
+
+---
+
+## 9. Shortform: pre-filter candidate cost
+
+**Current state (2026-04-18):** first real-world run scored 17 candidates
+via Claude CLI at `--effort max` = ~14 min. The pipeline pre-filters
+by duration (0.5× sweet_min to 2.5× sweet_max) in `pipeline.py`, but
+cost still scales linearly with candidate count.
+
+**Upgrade paths:**
+
+1. **Heuristic prefilter stage** — drop candidates with audio-energy peak
+   below a threshold, or with word count < 50 (too little substance) /
+   > 250 (rambling). Runs in milliseconds; could cut candidate count
+   ~50%.
+2. **Two-pass LLM scoring** — first a cheap `sonnet` pass over all
+   candidates to get a rough rank, then `opus --effort max` on the
+   top-K. Halves the effort-max cost.
+3. **Batch scoring** — send 5–10 candidates per Claude call instead of
+   one. Saves prompt + thinking overhead. Requires prompt tuning to
+   keep per-candidate accuracy.
+
+Recommendation: ship (1) first (trivial), then (2) if scoring latency
+still matters on real hardware.
+
+---
+
+## 10. Cosmetic: misleading "model=..." log line
+
+When Claude CLI is the active backend, Stage B logs
+`model=mlx-community/Llama-3.3-70B-Instruct-4bit` because it prints
+`config.LLM_MODEL` regardless of dispatcher. Fixed in a follow-up — now
+labels `backend=claude (opus, effort=max)` vs `backend=mlx (...)`. See
+`src/stages/transcribe.py::run_analyze`.
+
+---
+
+## 11. Bash/subprocess timeouts killing long runs
+
+**Current state:** running the pipeline via a background-task mechanism
+with a 10-min kill timer silently terminates Python mid-run. The
+workaround is `nohup python -m src.cli ... & disown`. For interactive
+shells + CI this isn't an issue; documented as a gotcha in
+`CLAUDE.md §6.12`.
+
+No code change needed — the pipeline itself handles everything correctly
+when given sufficient wall-clock.

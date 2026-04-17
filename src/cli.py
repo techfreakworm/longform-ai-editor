@@ -65,6 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_unify = sub.add_parser("unify", help="Stage D — merge decisions into segments.json")
     p_unify.add_argument("--cursor", type=Path, default=None,
                          help="Cursor CSV for auto-zoom (optional)")
+    p_unify.add_argument("--screen", type=Path, default=None,
+                         help="Screen recording (enables element-aware zoom OCR snap)")
     p_unify.add_argument("--screen-w", type=int, default=2560,
                          help="Recorded display width in pixels (for cursor normalization)")
     p_unify.add_argument("--screen-h", type=int, default=1440,
@@ -118,6 +120,28 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Skip M6 denoise stage (currently always skipped until M6 lands)")
     _add_common_paths(p_run)
 
+    p_short = sub.add_parser("shortform",
+                             help="Shortform: portrait 9:16 clips from a long source")
+    p_short.add_argument("--screen", type=Path, default=None,
+                         help="Dual-track screen input (ext.mov)")
+    p_short.add_argument("--webcam", type=Path, default=None,
+                         help="Dual-track webcam input (cam.mov)")
+    p_short.add_argument("--audio", type=Path, default=None,
+                         help="Dual-track audio input (merged.mp4)")
+    p_short.add_argument("--composited", type=Path, default=None,
+                         help="Single composited mp4 (alternative to dual-track)")
+    p_short.add_argument("--cursor", type=Path, default=None,
+                         help="cursor.csv for screen-crop centering (optional)")
+    p_short.add_argument("--output-dir", type=Path, default=None,
+                         help="Output dir for shorts (default: OUTPUT_DIR/shorts)")
+    p_short.add_argument("--top", type=int, default=3,
+                         help="Number of top-ranked clips to render (default: 3)")
+    p_short.add_argument("--min-sec", type=float, default=30.0,
+                         help="Target minimum clip length (default: 30)")
+    p_short.add_argument("--max-sec", type=float, default=60.0,
+                         help="Target maximum clip length (default: 60)")
+    _add_common_paths(p_short)
+
     sub.add_parser("verify", help="Environment sanity check")
 
     return parser
@@ -149,6 +173,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "run":
         from src.pipeline import run_all
         return run_all(args)
+    elif args.command == "shortform":
+        from src.shortform.pipeline import run_all as shortform_run_all
+        return shortform_run_all(args)
     elif args.command == "verify":
         import subprocess
         script = Path(__file__).parent.parent / "scripts" / "verify_env.py"

@@ -82,12 +82,23 @@ def run_all(args: argparse.Namespace) -> int:
         return rc
 
     # -----------------------------------------------------------
+    # Stage C.2 — face visibility (Apple Vision, macOS only)
+    # -----------------------------------------------------------
+    print("\n========= Stage C.2 — face visibility =========")
+    from src.stages.face_visibility import run as face_run
+    try:
+        face_run(webcam, work_dir / "face_absent.json")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("face_visibility failed: %s — triple-intersection will no-op", exc)
+
+    # -----------------------------------------------------------
     # Stage D — unify segments
     # -----------------------------------------------------------
     print("\n========= Stage D — unify =========")
     from src.stages.unify_segments import run as unify_run
     unify_args = argparse.Namespace(
         cursor=cursor,
+        screen=screen,
         screen_w=getattr(args, "screen_w", 2560),
         screen_h=getattr(args, "screen_h", 1440),
         origin_x=getattr(args, "origin_x", 0.0),
