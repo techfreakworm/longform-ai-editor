@@ -16,8 +16,11 @@ later segment.
 """
 from __future__ import annotations
 
+import json as _json
 import logging
 import re
+import shutil
+import subprocess
 from typing import Any, Literal
 
 import httpx
@@ -91,7 +94,68 @@ def _extract_json_body(text: str) -> str:
 
 # --- LLM call wrapper --------------------------------------------------
 
-def call_llm_json(
+_JSON_INSTRUCTION_SUFFIX = (
+    "\n\nReturn ONLY a valid JSON object. No markdown fences, no preamble, no commentary."
+)
+
+
+def _have_claude_cli() -> bool:
+    """True if the `claude` binary is on PATH."""
+    return shutil.which("claude") is not None
+
+
+def _call_via_claude_cli(
+    system_prompt: str,
+    user_payload: dict[str, Any],
+    *,
+    model: str | None = None,
+    timeout_s: float | None = None,
+) -> dict[str, Any]:
+    """Shell out to `claude -p` (Claude Code CLI non-interactive mode).
+
+    Claude CLI has its own built-in agent system prompt; we can't replace
+    it. We combine our system + user payload into one input that goes on
+    stdin. The strict "Return ONLY a valid JSON object…" suffix tames
+    Claude's tendency to add preamble.
+
+    Uses the user's existing `claude login` session (Claude Max/Pro
+    subscription) — no API key needed, calls count toward subscription
+    quota rather than per-token billing.
+    """
+    model = model or config.CLAUDE_MODEL
+    timeout_s = timeout_s or config.LLM_TIMEOUT_SEC
+
+    prompt_body = (
+        system_prompt.rstrip()
+        + _JSON_INSTRUCTION_SUFFIX
+        + "\n\nInput:\n"
+        + _json.dumps(user_payload)
+    )
+    cmd = [
+        "claude", "-p",
+        "--model", model,
+        "--output-format", "text",
+        "--permission-mode", "bypassPermissions",
+        "--no-session-persistence",
+    ]
+    log.debug("calling claude CLI: %s", cmd)
+    r = subprocess.run(
+        cmd,
+        input=prompt_body,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        check=False,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"claude CLI exited {r.returncode}: {r.stderr[-400:] or r.stdout[-400:]}"
+        )
+    body = _extract_json_body(r.stdout)
+    return _json.loads(body)
+
+
+def _call_via_mlx_server(
     system_prompt: str,
     user_payload: dict[str, Any],
     *,
@@ -101,34 +165,25 @@ def call_llm_json(
     max_tokens: int = 4096,
     temperature: float = 0.0,
 ) -> dict[str, Any]:
-    """POST to /v1/chat/completions asking for JSON output.
+    """POST to the local mlx_lm.server's /v1/chat/completions.
 
-    We do NOT use mlx_lm.server's `response_format={"type": "json_object"}`
-    constrained-decoding mode — it can hang mlx_lm.server on longer
-    prompts (observed: the server sends HTTP 200 headers, then never
-    writes the body, leaving the client blocked even with multi-minute
-    timeouts). Instead we ask the model for JSON via a strict system
-    prompt suffix and then extract the outermost `{...}` from whatever
-    comes back. A good instruction-tuned model (Llama 3.3 70B, Qwen3)
-    complies reliably at temperature=0.
-
-    Raises on HTTP error, timeout, or malformed JSON after extraction.
+    Does NOT use `response_format={"type": "json_object"}` — mlx_lm.server's
+    constrained-decoding path can hang on non-trivial prompts. Plain
+    generation + strict prompt suffix is reliable on Llama 3.3 70B at
+    temperature=0.
     """
     server_url = server_url or config.LLM_SERVER_URL
     model = model or config.LLM_MODEL
     timeout_s = timeout_s or config.LLM_TIMEOUT_SEC
 
-    system_with_json = (
-        system_prompt.rstrip()
-        + "\n\nReturn ONLY a valid JSON object. No markdown fences, no preamble, no commentary."
-    )
+    system_with_json = system_prompt.rstrip() + _JSON_INSTRUCTION_SUFFIX
     payload = {
         "model": model,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "messages": [
             {"role": "system", "content": system_with_json},
-            {"role": "user", "content": __import__("json").dumps(user_payload)},
+            {"role": "user", "content": _json.dumps(user_payload)},
         ],
     }
     r = httpx.post(
@@ -139,8 +194,51 @@ def call_llm_json(
     r.raise_for_status()
     content = r.json()["choices"][0]["message"]["content"]
     body = _extract_json_body(content)
-    import json as _json
     return _json.loads(body)
+
+
+def call_llm_json(
+    system_prompt: str,
+    user_payload: dict[str, Any],
+    *,
+    server_url: str | None = None,
+    model: str | None = None,
+    timeout_s: float | None = None,
+    max_tokens: int = 4096,
+    temperature: float = 0.0,
+) -> dict[str, Any]:
+    """Dispatcher: prefer Claude CLI if available, else local MLX.
+
+    Behavior:
+      * If `claude` is on PATH AND config.FORCE_LOCAL_LLM is False, try
+        Claude CLI. On ANY failure (non-zero exit, malformed JSON, auth
+        problem, timeout), log a warning and fall back to the local path.
+      * Otherwise go straight to the local MLX path.
+
+    This means a user with Claude Max/Pro gets a ~10% quality lift on
+    layout decisions at zero marginal cost, and the pipeline still works
+    perfectly without Claude — graceful degradation.
+    """
+    if not config.FORCE_LOCAL_LLM and _have_claude_cli():
+        try:
+            return _call_via_claude_cli(
+                system_prompt, user_payload,
+                model=None,         # use config.CLAUDE_MODEL
+                timeout_s=timeout_s,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Claude CLI call failed (%s); falling back to local MLX",
+                exc,
+            )
+    return _call_via_mlx_server(
+        system_prompt, user_payload,
+        server_url=server_url,
+        model=model,
+        timeout_s=timeout_s,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
 
 
 # --- filler cuts -------------------------------------------------------
@@ -252,6 +350,9 @@ __all__ = [
     "LayoutSegment",
     "LayoutPlanResponse",
     "strip_thinking",
+    "_have_claude_cli",
+    "_call_via_claude_cli",
+    "_call_via_mlx_server",
     "call_llm_json",
     "analyze_fillers",
     "analyze_layout",

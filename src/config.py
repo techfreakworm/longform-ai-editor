@@ -38,6 +38,18 @@ LLM_MODEL = os.getenv("LLM_MODEL", "mlx-community/Llama-3.3-70B-Instruct-4bit")
 LLM_TIMEOUT_SEC = _f("LLM_TIMEOUT_SEC", 600.0)
 LLM_MAX_RETRIES = _i("LLM_MAX_RETRIES", 3)
 
+# ----- Claude Code CLI fallback ----------------------------------------
+# If `claude` is on PATH and FORCE_LOCAL_LLM is not set, analyze_llm
+# prefers Claude Code CLI over the local MLX server. Graceful degradation:
+# on any failure (auth, network, rate limit) we log a warning and fall
+# back to the local path. Counts toward your Claude Max/Pro quota — no
+# per-call billing unless you explicitly use an API key.
+FORCE_LOCAL_LLM = os.getenv("FORCE_LOCAL_LLM", "").lower() in {"1", "true", "yes"}
+# Model alias understood by `claude --model <alias>`. "opus" resolves to
+# the latest Opus; "sonnet" to the latest Sonnet. Full IDs also accepted
+# (e.g. "claude-opus-4-7").
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "opus")
+
 # ----- Transcription ----------------------------------------------------
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "mlx-community/whisper-large-v3-turbo")
 

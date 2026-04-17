@@ -1,11 +1,19 @@
 """Tests for Stage B.2 — LLM-driven filler + layout analysis.
 
-Unit tests mock httpx to avoid the running LLM server. @slow integration
-tests hit the real server if it's reachable.
+Unit tests mock httpx (local MLX path) or subprocess (Claude CLI path) to
+avoid needing a running LLM. @slow integration tests hit the real
+backends if reachable.
+
+The `_force_local_llm_path` autouse fixture pins the dispatcher to the
+local-MLX path for most tests so legacy httpx-mocking tests don't
+accidentally go through Claude CLI (which would be present on the dev's
+machine but absent in CI). Tests that want to exercise the Claude path
+use `claude_enabled` explicitly.
 """
 from __future__ import annotations
 
 import json
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -16,13 +24,32 @@ from src.stages.analyze_llm import (
     FillerCutsResponse,
     LayoutPlanResponse,
     LayoutSegment,
+    _call_via_claude_cli,
     _extract_json_body,
     _fill_coverage_gaps,
+    _have_claude_cli,
     analyze_fillers,
     analyze_layout,
     call_llm_json,
     strip_thinking,
 )
+
+
+@pytest.fixture(autouse=True)
+def _force_local_llm_path(monkeypatch):
+    """Default: dispatcher goes to local MLX so httpx mocks work.
+    Tests that need the Claude path explicitly override this.
+    """
+    monkeypatch.setattr("src.stages.analyze_llm._have_claude_cli", lambda: False)
+
+
+@pytest.fixture
+def claude_enabled(monkeypatch):
+    """Opt-in: enable Claude CLI dispatch for a specific test."""
+    monkeypatch.setattr("src.stages.analyze_llm._have_claude_cli", lambda: True)
+    # Also ensure FORCE_LOCAL_LLM is not set
+    from src import config
+    monkeypatch.setattr(config, "FORCE_LOCAL_LLM", False)
 
 
 # --- strip_thinking -----------------------------------------------------
@@ -231,6 +258,127 @@ def test_analyze_layout_rejects_bad_layout() -> None:
         out = analyze_layout([], total_duration=10.0)
     assert m.call_count == 2
     assert out.segments[0].layout == "pip"
+
+
+# --- Claude CLI path --------------------------------------------------
+
+def _mock_completed_process(stdout: str, returncode: int = 0, stderr: str = "") -> MagicMock:
+    m = MagicMock(spec=subprocess.CompletedProcess)
+    m.stdout = stdout
+    m.returncode = returncode
+    m.stderr = stderr
+    return m
+
+
+def test_call_via_claude_cli_parses_clean_output(claude_enabled) -> None:
+    """Happy path: Claude returns pristine JSON on stdout."""
+    with patch("src.stages.analyze_llm.subprocess.run",
+               return_value=_mock_completed_process('{"result": "ok"}')) as m:
+        out = _call_via_claude_cli("sys", {"q": 1})
+    cmd = m.call_args[0][0]
+    assert cmd[0] == "claude"
+    assert "-p" in cmd
+    assert "--model" in cmd
+    assert "--output-format" in cmd
+    assert "bypassPermissions" in cmd
+    assert out == {"result": "ok"}
+
+
+def test_call_via_claude_cli_tolerates_preamble(claude_enabled) -> None:
+    """Claude sometimes adds preamble. _extract_json_body pulls the {...}."""
+    noisy = "I'll analyze this for you.\n\n```json\n{\"cuts\": []}\n```\n"
+    with patch("src.stages.analyze_llm.subprocess.run",
+               return_value=_mock_completed_process(noisy)):
+        out = _call_via_claude_cli("sys", {})
+    assert out == {"cuts": []}
+
+
+def test_call_via_claude_cli_nonzero_exit_raises(claude_enabled) -> None:
+    """A failed CLI call surfaces as RuntimeError with the tail of stderr."""
+    with patch("src.stages.analyze_llm.subprocess.run",
+               return_value=_mock_completed_process("", returncode=1, stderr="auth error")):
+        with pytest.raises(RuntimeError, match="auth error"):
+            _call_via_claude_cli("sys", {})
+
+
+# --- Dispatcher logic -------------------------------------------------
+
+def test_dispatcher_prefers_claude_when_available(claude_enabled) -> None:
+    """Claude CLI is reached first; httpx.post is NOT called."""
+    with patch("src.stages.analyze_llm.subprocess.run",
+               return_value=_mock_completed_process('{"v": 1}')) as sub_m, \
+         patch("src.stages.analyze_llm.httpx.post") as http_m:
+        out = call_llm_json("sys", {})
+    assert sub_m.call_count == 1
+    assert http_m.call_count == 0
+    assert out == {"v": 1}
+
+
+def test_dispatcher_falls_back_to_local_when_claude_fails(claude_enabled) -> None:
+    """Claude CLI throws; dispatcher logs warning, retries with local MLX."""
+    http_resp = MagicMock(spec=httpx.Response)
+    http_resp.status_code = 200
+    http_resp.raise_for_status = MagicMock()
+    http_resp.json.return_value = {
+        "choices": [{"message": {"content": '{"v": 2}'}}],
+    }
+    with patch(
+        "src.stages.analyze_llm.subprocess.run",
+        return_value=_mock_completed_process("", returncode=2, stderr="boom"),
+    ) as sub_m, patch(
+        "src.stages.analyze_llm.httpx.post",
+        return_value=http_resp,
+    ) as http_m:
+        out = call_llm_json("sys", {})
+    assert sub_m.call_count == 1
+    assert http_m.call_count == 1
+    assert out == {"v": 2}
+
+
+def test_dispatcher_uses_local_when_claude_unavailable() -> None:
+    """Without the `claude_enabled` fixture, _have_claude_cli returns False
+    (per autouse `_force_local_llm_path`) and dispatcher goes straight to MLX.
+    """
+    http_resp = MagicMock(spec=httpx.Response)
+    http_resp.status_code = 200
+    http_resp.raise_for_status = MagicMock()
+    http_resp.json.return_value = {
+        "choices": [{"message": {"content": '{"v": 3}'}}],
+    }
+    with patch("src.stages.analyze_llm.subprocess.run") as sub_m, \
+         patch("src.stages.analyze_llm.httpx.post", return_value=http_resp) as http_m:
+        out = call_llm_json("sys", {})
+    assert sub_m.call_count == 0  # claude never attempted
+    assert http_m.call_count == 1
+    assert out == {"v": 3}
+
+
+def test_dispatcher_respects_force_local_env(claude_enabled, monkeypatch) -> None:
+    """FORCE_LOCAL_LLM=1 skips Claude even when the CLI is present."""
+    from src import config
+    monkeypatch.setattr(config, "FORCE_LOCAL_LLM", True)
+
+    http_resp = MagicMock(spec=httpx.Response)
+    http_resp.status_code = 200
+    http_resp.raise_for_status = MagicMock()
+    http_resp.json.return_value = {
+        "choices": [{"message": {"content": '{"v": 4}'}}],
+    }
+    with patch("src.stages.analyze_llm.subprocess.run") as sub_m, \
+         patch("src.stages.analyze_llm.httpx.post", return_value=http_resp) as http_m:
+        out = call_llm_json("sys", {})
+    assert sub_m.call_count == 0
+    assert http_m.call_count == 1
+    assert out == {"v": 4}
+
+
+def test_have_claude_cli_matches_which(monkeypatch) -> None:
+    import shutil
+    monkeypatch.setattr(shutil, "which",
+                        lambda name: "/usr/local/bin/claude" if name == "claude" else None)
+    assert _have_claude_cli() is True
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert _have_claude_cli() is False
 
 
 # --- INTEGRATION (real server) ---------------------------------------
