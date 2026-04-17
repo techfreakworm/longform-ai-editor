@@ -4,30 +4,31 @@
 No cloud credits, no per-render fees, no SaaS. Runs on your machine end-to-end.
 
 ```
-OBS session (ext.mov + cam.mov + merged.mp4 + cursor.csv)
+OBS session (ext.mov + cam.mov + merged.mp4 [+ cursor.csv])
                          ↓
-   ┌───────────────────────────────────────────────────┐
-   │ sync  →  transcribe+LLM  →  dead-zone detect      │
-   │         →  unify  →  render  (→ polish [TODO])    │
-   └───────────────────────────────────────────────────┘
+   ┌────────────────────────────────────────────────────┐
+   │ sync → transcribe+LLM → dead-zone detect → unify   │
+   │      → render (chunked) → polish (loudnorm)        │
+   └────────────────────────────────────────────────────┘
                          ↓
-                     final.mp4
+                     final.mp4   (1920×1080, HEVC, EBU R128)
 ```
 
 ---
 
 ## What it actually does (real measurements)
 
-On a 95.75-second test session the pipeline produced a polished **42.99-second**
-`1920×1080 HEVC 60 fps` final in **7.6 seconds of render wall-clock** on an
-M5 Max. The pipeline:
+**Short clip** (95.75 s test session, M5 Max): polished **42.99 s** 1920×1080 HEVC
+in **7.6 s of render wall-clock**. 47 words transcribed, 7 filler cuts, 5 layout
+sections, 3 dead zones, webcam composited as PIP over the screen, speed ramps
+via `setpts` + pitch-preserving `atempo`.
 
-- transcribed the webcam audio (47 words, mlx-whisper large-v3-turbo)
-- detected **7 filler cuts** (fillers / false-starts / repeats) via Llama 3.3 70B
-- laid out **5 tutorial sections** (cam_full intro → pip → screen_full demo → pip → cam_full outro)
-- detected **3 dead zones** on screen + audio (one 42-second cut, two speed@8x ramps)
-- composited webcam as PiP over the screen, respecting layout switches per segment
-- applied speed ramps via `setpts` + pitch-preserving `atempo` chains
+**Long clip** (34.7 min stitched from a 3-session recording, M5 Max): polished
+**27:58** 1920×1080 HEVC in ~6 min render wall-clock. 3386 words transcribed,
+7 filler cuts, 6 layout sections, 84 dead zones → 173 segments (117 PIP with
+circle mask, 52 screen-full, 4 cam-full; 42 at 8× speed, 35 at 4×). Rendered in
+6 chunks of ≤30 segments each and stream-copy-concatenated at the end (see
+[Why chunked rendering](#why-chunked-rendering)).
 
 | Stage | Role | Status | Tests |
 |---|---|---|---|
@@ -35,13 +36,13 @@ M5 Max. The pipeline:
 | M0b · cursor tracker | record-time cursor/click/clap log | ✅ | — |
 | M1 · Stage A sync | clap-cue alignment, CSV ↔ video time | ✅ | 18 |
 | cursor_zoom (Cap port) | AGPL algorithm port for auto-zoom | ✅ | 22 |
-| M2 · Stage B transcribe + LLM | mlx-whisper + Llama 3.3 filler/layout | ✅ | 32 |
+| M2 · Stage B transcribe + LLM | mlx-whisper + Llama 3.3 / Claude CLI | ✅ | 33 |
 | M3 · Stage C dead-zone detect | freezedetect + silencedetect intersection | ✅ | 32 |
 | M4 · Stage D unify segments | merge all decisions → canonical edit list | ✅ | 46 |
-| M5 · Stage E render | single-pass ffmpeg filter_complex | ✅ | 30 |
-| M6 · Stage F polish | (optional) DeepFilterNet denoise + ffmpeg-normalize EBU R128 | ✅ | 10 |
+| M5 · Stage E render | chunked ffmpeg filter_complex + concat demuxer | ✅ | 56 |
+| M6 · Stage F polish | optional DeepFilterNet denoise + EBU R128 loudnorm | ✅ | 10 |
 
-**190 tests passing** (179 fast + 11 integration against real ffmpeg / LLM / fixtures).
+**208 fast tests + 11 slow integration tests** (real ffmpeg / LLM / fixtures).
 
 ---
 
@@ -101,14 +102,27 @@ Record your tutorial. When done:
 
 ## Run the pipeline
 
-In a separate terminal, start the LLM server (takes ~60 s to load Llama into memory):
+### LLM backend — Claude CLI (preferred) or local MLX
+
+The filler-cuts + layout-plan LLM calls auto-dispatch based on what's available:
+
+| Condition | Backend |
+|---|---|
+| `claude` on PATH AND `FORCE_LOCAL_LLM` not set | Claude Code CLI (uses your `claude login`) |
+| Claude unavailable OR `FORCE_LOCAL_LLM=1` | Local `mlx_lm.server` |
+
+For the **local** path, start the server in a separate terminal (~60 s to load
+Llama into memory):
 
 ```bash
 source venv/bin/activate
 mlx_lm.server --model mlx-community/Llama-3.3-70B-Instruct-4bit --port 8080
 ```
 
-Then one command:
+For the **Claude** path, just make sure `claude -p --help` works — no server
+needed. Calls count toward your Claude Max/Pro subscription.
+
+### One-command run
 
 ```bash
 python -m src.cli run \
@@ -183,6 +197,88 @@ Python deps, LLM server, model cache).
 
 ---
 
+## Running on old recordings (no clap, no cursor)
+
+If your source files predate the clap-cue / cursor-tracker workflow (or you
+simply don't want them), skip Stage A auto-sync with `--manual-offset 0`:
+
+```bash
+python -m src.cli run \
+    --screen ext.mov --webcam cam.mov --audio merged.mp4 \
+    --output final.mp4 \
+    --manual-offset 0
+```
+
+`--manual-offset 0` is safe when `ext.mov` and `cam.mov` come from the same OBS
+`source-record` session — they share a wall-clock start time. Omit `--cursor`
+too and cursor-zoom is simply disabled. Everything else (filler cuts, layout,
+dead zones) runs normally.
+
+## Multi-session recordings (OBS restart mid-session)
+
+If you had to pause OBS and restart mid-recording, you'll have N sets of
+`(ext, cam, merged)` files. Stitch each stream back into one continuous file
+with ffmpeg's concat demuxer — no re-encoding, seconds to run:
+
+```bash
+# List the files in chronological order (one per stream).
+cat > /tmp/cam.txt <<EOF
+file '/Users/you/Movies/cam2026-04-12 19-03-51.mov'
+file '/Users/you/Movies/cam2026-04-12 19-24-07.mov'
+file '/Users/you/Movies/cam2026-04-12 19-44-28.mov'
+EOF
+# Same for ext.txt and merged.txt, then:
+for s in cam ext merged; do
+    ffmpeg -y -f concat -safe 0 -i /tmp/$s.txt -c copy /Users/you/Movies/stitched/$s.mov
+done
+```
+
+Then run the pipeline on the stitched files.
+
+## Circle PIP (webcam bubble) and face offset
+
+By default the webcam is composited as a **circular talking-head bubble** over
+the screen (alpha-masked via `assets/circle_mask.png` + ffmpeg `alphamerge`).
+The webcam is cropped to a face-centered square BEFORE scaling into the circle
+so facial proportions are preserved even if you sit off-center.
+
+Environment tunables (or override in `.env`):
+
+| Var | Default | Meaning |
+|---|---|---|
+| `PIP_SHAPE` | `circle` | `circle` (alpha mask) or `rect` (classic rectangle) |
+| `PIP_DIAMETER` | `320` | Pixels — diameter of circle PIP |
+| `PIP_FACE_X` | `0.5` | Horizontal face position on webcam (0.0–1.0) |
+| `PIP_FACE_Y` | `0.5` | Vertical face position on webcam (0.0–1.0) |
+| `CIRCLE_MASK_PATH` | `assets/circle_mask.png` | Grayscale alpha-mask override |
+
+If you sit to the left of frame, try `PIP_FACE_X=0.35`; to the right, `0.65`.
+See [`docs/future-improvements.md`](docs/future-improvements.md) for the
+auto-detection roadmap (Apple Vision / mediapipe / InsightFace options).
+
+## Why chunked rendering
+
+Stage E doesn't build one giant ffmpeg filter graph for the whole edit. It
+batches segments (`chunk_size=30` by default), renders each batch to its own
+intermediate mp4, and stitches them at the end with the concat **demuxer**
+(stream-copy, no re-encode). Reasons:
+
+- On long edits with many `atempo`-chained speed ramps, the concat **filter**
+  accumulates timestamp drift per segment — the muxer output queue piles
+  up ("N buffers queued in out_#0:0") until OOM kills ffmpeg.
+- `hevc_videotoolbox` stalls on very complex graphs (200+ filter chains).
+  Keeping each invocation small keeps it reliable.
+- The mask PNG is loaded **once per ffmpeg invocation** via `movie=...,split=N`
+  rather than `movie=` per segment — cuts 100+ redundant file opens.
+- `alphamerge=shortest=1` (required because the mask is infinitely looped)
+  ensures each PIP segment EOFs with the webcam so the concat filter can
+  close it cleanly.
+
+`RENDER_ENCODER=libx264` is the escape hatch if `hevc_videotoolbox` still
+misbehaves on a specific clip.
+
+---
+
 ## Architecture
 
 Brief. See [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for milestone-level
@@ -225,6 +321,12 @@ artifacts to force a re-run of that stage.
   grammar-constrained decoding hangs reproducibly on non-trivial prompts
   against Llama 3.3 70B. Llama at `temperature=0` with a strict system
   suffix (`"Return ONLY a valid JSON object..."`) complies reliably.
+- **Claude CLI as preferred LLM backend**: if `claude` is on PATH, the
+  dispatcher shells out to `claude -p --model opus --output-format text` for
+  filler + layout calls. Uses the existing subscription auth (no API key,
+  counts toward Claude Max/Pro quota). Falls back to local MLX gracefully
+  on any failure. Measured ~10% quality lift on layout decisions at zero
+  marginal cost for subscribers.
 - **Stream-copy-then-re-encode-in-render**: Stage A's optional `--trim` uses
   `-c copy` which snaps to keyframes; precise trim accuracy comes from
   Stage E applying the offset on its own via per-segment `trim + setpts`.
@@ -234,6 +336,21 @@ artifacts to force a re-run of that stage.
 - **Cursor zoom split at boundaries**: a Segment with N cursor-zoom windows
   becomes ≤2N+1 RenderSegments, each with at most one static crop. Keeps the
   ffmpeg filter graph simple (no per-frame `crop=x:y` expressions).
+- **Smooth zoom via scale + static crop** (not time-varying crop): ffmpeg's
+  `crop` filter re-evaluates `x`/`y` per frame but `w`/`h` only at init.
+  To animate a zoom, we `scale=w=EXPR:h=EXPR:eval=frame` by a cubic-Hermite
+  smoothstep `z(t)` and center-crop a fixed `(in_w × in_h)` window with
+  panning `x`/`y` — gives ease-in / hold / ease-out without the snap.
+- **Circle PIP via shared alpha mask**: one `movie='assets/circle_mask.png',
+  scale=D:D,format=gray,loop=-1:size=1,split=N` at the top of the graph
+  produces N per-segment labels consumed by `alphamerge=shortest=1`.
+  `shortest=1` is load-bearing — the looped mask never EOFs, so without it
+  the concat filter downstream waits forever.
+- **Chunked rendering + concat demuxer**: long edits are batched into
+  N-segment chunks; each chunk's graph stays small enough for
+  `hevc_videotoolbox` to stream through without muxer-queue blowup. Final
+  stitch is stream-copy (no re-encode). See
+  [Why chunked rendering](#why-chunked-rendering).
 
 ---
 
@@ -263,13 +380,24 @@ artifacts to force a re-run of that stage.
   on short samples with mixed speech + silence). Dynamic mode is the safer
   choice per the spec — it preserves peaks without clipping. For a full
   30-min tutorial the result usually lands within ±0.5 LU.
+- **Long renders lose ~1–2% duration to `atempo` resampling drift.** Each
+  speed-ramped segment's audio is slightly shorter than `duration / speed`
+  because atempo interpolates. Over 70+ speed-ramped segments this adds up —
+  the 34.7 min example above came out to 27:58 vs unify's theoretical
+  31:58. Tolerable for tutorial content; if you need frame-exact output,
+  bump `CUT_MIN_SEC` so more dead zones are hard-cut instead of sped up.
 - **macOS only.** MLX is Apple-silicon-specific; ScreenCaptureKit is macOS-specific.
 - **mlx_lm.server must run on `--port 8080`.** Override via `.env`
-  (`LLM_SERVER_URL=http://host:port/v1`).
+  (`LLM_SERVER_URL=http://host:port/v1`). Irrelevant if you use the Claude CLI
+  backend.
 - **Constrained-decoding JSON mode avoided.** If you swap in a different
   backend (vLLM, Ollama) that handles `response_format=json_object` well, the
   `call_llm_json()` helper would benefit from re-enabling it. Currently
   disabled as a reliability measure against mlx_lm.server's hangs.
+- **Circle-PIP face position is a static offset**, not per-frame tracking.
+  If you move chair-to-chair mid-clip, half your face may end up out of the
+  circle. One-pass face-detection upgrade documented in
+  [`docs/future-improvements.md`](docs/future-improvements.md).
 - **Cursor zoom needs manual origin calibration** on multi-monitor setups.
   See the table above for common positions.
 - **Dead-zone detection is heuristic.** 10–20% false positive / false negative
@@ -286,9 +414,14 @@ artifacts to force a re-run of that stage.
 
 ```
 long-form-editor/
+├── CLAUDE.md                       # per-session guidance for Claude Code
 ├── IMPLEMENTATION_PLAN.md          # milestone-by-milestone build plan
 ├── pyproject.toml                  # deps, dev deps, pytest markers
 ├── .env.example                    # tunable thresholds + LLM settings
+├── assets/
+│   └── circle_mask.png             # grayscale alpha mask for circle PIP
+├── docs/
+│   └── future-improvements.md      # face-aware PIP + feathered edges + more
 ├── scripts/
 │   ├── install.sh                  # one-shot full install
 │   ├── install_cursor_tracker.sh   # record-time tracker only (separate venv)
@@ -301,17 +434,17 @@ long-form-editor/
 │   ├── requirements.txt
 │   └── README.md
 ├── src/
-│   ├── cli.py                      # argparse entry: sync|analyze|detect-dead|unify|render|run|verify
-│   ├── config.py                   # paths, thresholds, prompts (env-overridable)
+│   ├── cli.py                      # argparse entry: sync|analyze|detect-dead|unify|render|polish|run|verify
+│   ├── config.py                   # paths, thresholds, prompts, PIP knobs (env-overridable)
 │   ├── pipeline.py                 # run_all orchestrator
 │   ├── stages/
 │   │   ├── sync_clap.py            # Stage A
 │   │   ├── transcribe.py           # Stage B.1
-│   │   ├── analyze_llm.py          # Stage B.2
+│   │   ├── analyze_llm.py          # Stage B.2 (Claude CLI + MLX server dispatcher)
 │   │   ├── dead_zone_detect.py     # Stage C
 │   │   ├── unify_segments.py       # Stage D
-│   │   ├── render.py               # Stage E
-│   │   ├── polish.py               # Stage F (skeleton, M6 TODO)
+│   │   ├── render.py               # Stage E (chunked + circle PIP + smooth zoom)
+│   │   ├── polish.py               # Stage F (loudnorm, optional denoise)
 │   │   └── cursor_zoom.py          # Cap algorithm port
 │   └── utils/
 │       ├── ffmpeg_helpers.py       # subprocess, ffprobe wrappers
@@ -320,11 +453,11 @@ long-form-editor/
 └── tests/
     ├── fixtures/real/              # symlinks to real OBS fixtures (gitignored)
     ├── test_sync.py                # 18
-    ├── test_analyze_llm.py         # 25
+    ├── test_analyze_llm.py         # 33
     ├── test_transcribe.py          # 12
     ├── test_dead_zone_detect.py    # 19
     ├── test_unify_segments.py      # 46
-    ├── test_render.py              # 30
+    ├── test_render.py              # 56
     ├── test_cursor_zoom.py         # 22
     ├── test_log_parsers.py         # 8
     └── test_timecodes.py           # 8
