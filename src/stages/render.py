@@ -67,6 +67,18 @@ class RenderOptions:
     pip_w: int = 480
     pip_h: int = 270
     pip_margin: int = 32       # corner offset in pixels
+    # Shape of the webcam PIP. "circle" punches the webcam through a
+    # grayscale alpha mask (see circle_mask_path) before overlaying;
+    # "rect" keeps the classic pip_w×pip_h rectangle.
+    pip_shape: str = field(default_factory=lambda: config.PIP_SHAPE)
+    pip_diameter: int = field(default_factory=lambda: config.PIP_DIAMETER)
+    # Face position in the webcam frame (0.0–1.0). Used only by the
+    # circle path — before scaling into the circle, the webcam is cropped
+    # to a square of side=min(iw,ih) centered on (cam_face_x*iw, cam_face_y*ih).
+    # Move toward 0.3 if you sit left of center, 0.7 if right of center.
+    cam_face_x: float = field(default_factory=lambda: config.PIP_FACE_X)
+    cam_face_y: float = field(default_factory=lambda: config.PIP_FACE_Y)
+    circle_mask_path: Path = field(default_factory=lambda: config.CIRCLE_MASK_PATH)
     video_bitrate: str = "12M"
     audio_bitrate: str = "192k"
     audio_sample_rate: int = 48000
@@ -263,6 +275,54 @@ def _scale_fill(out_w: int, out_h: int) -> str:
     )
 
 
+def _pip_circle_webcam_branch(i: int, opts: RenderOptions) -> list[str]:
+    """Filter lines that turn [w{i}_trim] into a circular [w{i}_pip].
+
+    Pipeline (three chains):
+      1. `movie=<mask>` source → scale to PIP diameter → gray → [m{i}]
+      2. [w{i}_trim] → face-centered square crop → scale to DxD → yuva420p → [w{i}_sq]
+      3. [w{i}_sq] + [m{i}] → alphamerge → [w{i}_pip]
+
+    Why face-centered crop FIRST, then scale to square:
+      The webcam is typically 16:9. Scaling it directly to a square would
+      squash the face. Cropping to a square of side=min(iw,ih) centered on
+      the user's face preserves facial proportions; the speaker can sit
+      off-center (cam_face_x != 0.5) without ending up with half a face in
+      the circle.
+
+    Escaping: expressions with commas are wrapped in single quotes so the
+    filter-graph parser doesn't split on the inner commas. The mask path
+    is single-quoted so colons/spaces in the filename don't break parsing.
+    """
+    D = opts.pip_diameter
+    cx = opts.cam_face_x
+    cy = opts.cam_face_y
+    mask_path = str(opts.circle_mask_path)
+
+    # Square side = shorter of the two input dimensions; ffmpeg resolves
+    # `min(iw,ih)` at filter-init time, so this is a constant per segment.
+    side = "min(iw,ih)"
+    x_expr = f"clip({cx:g}*iw-{side}/2,0,iw-{side})"
+    y_expr = f"clip({cy:g}*ih-{side}/2,0,ih-{side})"
+
+    return [
+        # `loop=-1:size=1` repeats the single-frame mask for the entire
+        # segment — without it, alphamerge would truncate the PIP after
+        # one frame. size=1 means "buffer 1 frame then loop it forever".
+        (
+            f"movie='{mask_path}',scale={D}:{D},format=gray,"
+            f"loop=loop=-1:size=1[m{i}]"
+        ),
+        (
+            f"[w{i}_trim]"
+            f"crop=w='{side}':h='{side}':x='{x_expr}':y='{y_expr}',"
+            f"scale={D}:{D},format=yuva420p,setsar=1"
+            f"[w{i}_sq]"
+        ),
+        f"[w{i}_sq][m{i}]alphamerge[w{i}_pip]",
+    ]
+
+
 def _segment_branches(i: int, rs: RenderSegment, opts: RenderOptions) -> list[str]:
     """All filter lines needed to produce [v{i}] and [a{i}] for segment i.
 
@@ -330,10 +390,16 @@ def _segment_branches(i: int, rs: RenderSegment, opts: RenderOptions) -> list[st
             f"[{s_branch}]{_scale_fill(opts.output_w, opts.output_h)},"
             f"setsar=1[s{i}_bg]"
         )
-        lines.append(
-            f"[w{i}_trim]{_scale_fill(opts.pip_w, opts.pip_h)},"
-            f"setsar=1[w{i}_pip]"
-        )
+        if opts.pip_shape == "circle":
+            # Circle path: face-centered square crop + alphamerge with mask.
+            # Emits [w{i}_pip] — the same label the rectangle path produces,
+            # so the overlay line below is shape-agnostic.
+            lines.extend(_pip_circle_webcam_branch(i, opts))
+        else:
+            lines.append(
+                f"[w{i}_trim]{_scale_fill(opts.pip_w, opts.pip_h)},"
+                f"setsar=1[w{i}_pip]"
+            )
         lines.append(
             f"[s{i}_bg][w{i}_pip]"
             f"overlay=W-w-{opts.pip_margin}:H-h-{opts.pip_margin}"

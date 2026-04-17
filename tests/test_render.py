@@ -393,10 +393,126 @@ def test_build_filter_trim_times_precise() -> None:
 
 def test_build_filter_custom_pip_geometry() -> None:
     rs = [RenderSegment(start=0, end=10, speed=1.0, layout="pip", zoom=None)]
-    opts = RenderOptions(pip_w=640, pip_h=360, pip_margin=64)
+    # pip_w/pip_h are only honored by the rect path; circle uses pip_diameter.
+    opts = RenderOptions(pip_w=640, pip_h=360, pip_margin=64, pip_shape="rect")
     fc = build_filter_complex(rs, opts)
     assert "scale=640:360" in fc
     assert "overlay=W-w-64:H-h-64" in fc
+
+
+# --- circle PIP -------------------------------------------------------
+
+def test_render_options_default_pip_shape_is_circle() -> None:
+    """Circle is the default shape — matches the user's recorded preference.
+    If this breaks, most existing `pip` tests here are implicitly exercising
+    the circle path and will need explicit `pip_shape="rect"` opts to
+    keep testing the rectangle contract.
+    """
+    assert RenderOptions().pip_shape == "circle"
+
+
+def test_build_filter_pip_circle_loads_mask_via_movie() -> None:
+    rs = [RenderSegment(start=0, end=10, speed=1.0, layout="pip", zoom=None)]
+    fc = build_filter_complex(rs, RenderOptions())
+    # `movie=` is a SOURCE filter (no input label) — it reads the PNG from
+    # disk inside filter_complex, no extra `-i` flag needed on the cmdline.
+    assert "movie='" in fc
+    assert "circle_mask.png" in fc
+    # Mask must be scaled to the pip diameter and grayscaled for alphamerge.
+    assert "format=gray" in fc
+    # Single-frame PNG must be looped so alphamerge doesn't truncate the PIP
+    # to one frame — loop=-1:size=1 buffers the frame and repeats forever.
+    assert "loop=loop=-1:size=1" in fc
+
+
+def test_build_filter_pip_circle_uses_alphamerge() -> None:
+    rs = [RenderSegment(start=0, end=10, speed=1.0, layout="pip", zoom=None)]
+    fc = build_filter_complex(rs, RenderOptions())
+    assert "alphamerge" in fc
+    # Webcam needs an alpha-capable pixel format BEFORE alphamerge so the
+    # merged alpha survives through to overlay.
+    assert "format=yuva420p" in fc
+
+
+def test_build_filter_pip_circle_face_centered_crop() -> None:
+    """Default cam_face_x/y = 0.5 → face-centered crop expression must
+    reference 0.5 and min(iw,ih) in the webcam crop.
+    """
+    rs = [RenderSegment(start=0, end=10, speed=1.0, layout="pip", zoom=None)]
+    fc = build_filter_complex(rs, RenderOptions())
+    # Square side is min(iw, ih) so a 16:9 webcam gets cropped to a 1:1
+    # square before being scaled into the circle — prevents squashed faces.
+    assert "min(iw,ih)" in fc
+    # Default cam_face_x = 0.5 → coefficient must appear in the x clip expr.
+    assert "clip(0.5*iw-min(iw,ih)/2,0,iw-min(iw,ih))" in fc
+
+
+def test_build_filter_pip_circle_custom_face_x_off_center() -> None:
+    """Off-center speaker (cam_face_x=0.35) must shift the crop leftward —
+    that 0.35 coefficient must show up literally in the clip expression.
+    """
+    rs = [RenderSegment(start=0, end=10, speed=1.0, layout="pip", zoom=None)]
+    opts = RenderOptions(cam_face_x=0.35)
+    fc = build_filter_complex(rs, opts)
+    assert "clip(0.35*iw-min(iw,ih)/2,0,iw-min(iw,ih))" in fc
+
+
+def test_build_filter_pip_circle_scales_to_diameter() -> None:
+    rs = [RenderSegment(start=0, end=10, speed=1.0, layout="pip", zoom=None)]
+    opts = RenderOptions(pip_diameter=420)
+    fc = build_filter_complex(rs, opts)
+    # Both the mask AND the cropped webcam are scaled to diameter×diameter
+    # so they overlay pixel-perfectly in alphamerge.
+    assert fc.count("scale=420:420") == 2
+
+
+def test_build_filter_pip_circle_produces_w_pip_label() -> None:
+    """The overlay line is shape-agnostic — both circle and rect paths
+    must produce [w{i}_pip] so the overlay at the bottom works unchanged.
+    """
+    rs = [RenderSegment(start=0, end=10, speed=1.0, layout="pip", zoom=None)]
+    fc = build_filter_complex(rs, RenderOptions())
+    # alphamerge writes its result to [w0_pip] (same label as rect path).
+    assert "[w0_sq][m0]alphamerge[w0_pip]" in fc
+
+
+def test_build_filter_pip_rect_has_no_alphamerge_or_movie() -> None:
+    """The rect (classic) path must NOT touch the mask or alpha plumbing."""
+    rs = [RenderSegment(start=0, end=10, speed=1.0, layout="pip", zoom=None)]
+    opts = RenderOptions(pip_shape="rect")
+    fc = build_filter_complex(rs, opts)
+    assert "alphamerge" not in fc
+    assert "movie=" not in fc
+    assert "format=gray" not in fc
+
+
+def test_build_filter_pip_circle_overlay_unchanged() -> None:
+    """Overlay positioning is shape-agnostic — same corner offset for both
+    circle and rect. This guards against an accidental shape-dependent
+    position change that would shift the PIP across renders.
+    """
+    rs = [RenderSegment(start=0, end=10, speed=1.0, layout="pip", zoom=None)]
+    fc_circle = build_filter_complex(rs, RenderOptions(pip_shape="circle"))
+    fc_rect = build_filter_complex(rs, RenderOptions(pip_shape="rect"))
+    # Both graphs end with identical overlay coordinates on [v0].
+    assert "overlay=W-w-32:H-h-32[v0]" in fc_circle
+    assert "overlay=W-w-32:H-h-32[v0]" in fc_rect
+
+
+def test_build_filter_pip_circle_unique_labels_per_segment() -> None:
+    """Two PIP segments must get distinct mask/square labels so ffmpeg
+    doesn't reject duplicate filter outputs.
+    """
+    rs = [
+        RenderSegment(start=0, end=5, speed=1.0, layout="pip", zoom=None),
+        RenderSegment(start=5, end=10, speed=1.0, layout="pip", zoom=None),
+    ]
+    fc = build_filter_complex(rs, RenderOptions())
+    # Each segment gets its own mask load and square intermediate.
+    assert "[m0]" in fc and "[m1]" in fc
+    assert "[w0_sq]" in fc and "[w1_sq]" in fc
+    # And its own alphamerge output.
+    assert "[w0_pip]" in fc and "[w1_pip]" in fc
 
 
 # --- unknown-layout safety ------------------------------------------

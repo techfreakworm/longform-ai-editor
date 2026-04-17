@@ -72,6 +72,22 @@ VIDEO_RES_W = _i("VIDEO_RES_W", 1920)
 VIDEO_RES_H = _i("VIDEO_RES_H", 1080)
 VIDEO_FPS = _i("VIDEO_FPS", 30)
 
+# ----- PIP (picture-in-picture) ----------------------------------------
+# Circle cutout vs classic rectangle. Circle masks the webcam with a
+# pre-baked grayscale PNG via ffmpeg's alphamerge — looks like a "talking-
+# head bubble" floating over the screen demo.
+# Face position is a static offset applied at render time: the webcam is
+# cropped to a face-centered square BEFORE being scaled into the circle.
+# For a fixed camera this "set once" approach is sufficient; per-clip
+# auto-detection is tracked in docs/future-improvements.md.
+PIP_SHAPE = os.getenv("PIP_SHAPE", "circle")  # "circle" | "rect"
+PIP_DIAMETER = _i("PIP_DIAMETER", 320)        # pixels — diameter of circle PIP
+PIP_FACE_X = _f("PIP_FACE_X", 0.5)            # 0.0 left ↔ 1.0 right on the webcam frame
+PIP_FACE_Y = _f("PIP_FACE_Y", 0.5)            # 0.0 top  ↔ 1.0 bottom
+# Path resolved relative to the project root (long-form-editor/) by default.
+_ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
+CIRCLE_MASK_PATH = Path(os.getenv("CIRCLE_MASK_PATH", _ASSETS_DIR / "circle_mask.png"))
+
 # ----- Loudness --------------------------------------------------------
 LOUDNESS_TARGET = _f("LOUDNESS_TARGET", -14.0)
 TRUE_PEAK = _f("TRUE_PEAK", -1.5)
