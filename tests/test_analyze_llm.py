@@ -18,8 +18,11 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from src.stages.analyze_llm import (
+    DeadZoneCue,
+    DeadZoneCuesResponse,
     FillerCut,
     FillerCutsResponse,
     LayoutPlanResponse,
@@ -28,6 +31,7 @@ from src.stages.analyze_llm import (
     _extract_json_body,
     _fill_coverage_gaps,
     _have_claude_cli,
+    analyze_dead_zone_cues,
     analyze_fillers,
     analyze_layout,
     call_llm_json,
@@ -212,6 +216,67 @@ def test_analyze_fillers_empty_cuts_is_valid() -> None:
                return_value=_mock_httpx_response({"cuts": []})):
         out = analyze_fillers([])
     assert out.cuts == []
+
+
+def test_filler_cut_default_confidence_high() -> None:
+    """Old filler_cuts.json entries without the field should parse with
+    confidence='high' so pre-verifier artifacts still load."""
+    cut = FillerCut(start=1.0, end=1.5, reason="filler")
+    assert cut.confidence == "high"
+
+
+def test_filler_cut_accepts_low_confidence() -> None:
+    cut = FillerCut(start=1.0, end=1.5, reason="filler", confidence="low")
+    assert cut.confidence == "low"
+
+
+def test_filler_cut_rejects_invalid_confidence() -> None:
+    with pytest.raises(ValidationError):
+        FillerCut(start=1.0, end=1.5, reason="filler", confidence="maybe")
+
+
+# --- DeadZoneCue -------------------------------------------------------
+
+def test_dead_zone_cue_default_confidence_high() -> None:
+    cue = DeadZoneCue(start=10.0, end=120.0, reason="while installs")
+    assert cue.confidence == "high"
+
+
+def test_dead_zone_cue_accepts_low_confidence() -> None:
+    cue = DeadZoneCue(start=10.0, end=120.0, reason="unsure", confidence="low")
+    assert cue.confidence == "low"
+
+
+def test_dead_zone_cues_response_empty_default() -> None:
+    r = DeadZoneCuesResponse()
+    assert r.cues == []
+
+
+# --- analyze_dead_zone_cues (mocked) ---------------------------------
+
+def test_analyze_dead_zone_cues_parses_valid_response() -> None:
+    payload = {
+        "cues": [
+            {"start": 60.0, "end": 180.0,
+             "reason": "while installs", "confidence": "low"},
+            {"start": 200.0, "end": 205.0,
+             "reason": "let me skip this", "confidence": "high"},
+        ],
+    }
+    with patch("src.stages.analyze_llm.httpx.post",
+               return_value=_mock_httpx_response(payload)):
+        out = analyze_dead_zone_cues([{"word": "so", "start": 60, "end": 60.3}])
+    assert isinstance(out, DeadZoneCuesResponse)
+    assert len(out.cues) == 2
+    assert out.cues[0].confidence == "low"
+    assert out.cues[1].confidence == "high"
+
+
+def test_analyze_dead_zone_cues_empty() -> None:
+    with patch("src.stages.analyze_llm.httpx.post",
+               return_value=_mock_httpx_response({"cues": []})):
+        out = analyze_dead_zone_cues([])
+    assert out.cues == []
 
 
 def test_analyze_fillers_retries_on_bad_schema() -> None:

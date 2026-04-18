@@ -34,14 +34,29 @@ log = logging.getLogger(__name__)
 
 # --- schemas -----------------------------------------------------------
 
+Confidence = Literal["high", "low"]
+
+
 class FillerCut(BaseModel):
     start: float
     end: float
     reason: Literal["filler", "false_start", "repeat", "other"] = "filler"
+    confidence: Confidence = "high"
 
 
 class FillerCutsResponse(BaseModel):
     cuts: list[FillerCut] = Field(default_factory=list)
+
+
+class DeadZoneCue(BaseModel):
+    start: float
+    end: float
+    reason: str = ""
+    confidence: Confidence = "high"
+
+
+class DeadZoneCuesResponse(BaseModel):
+    cues: list[DeadZoneCue] = Field(default_factory=list)
 
 
 Layout = Literal["cam_full", "pip", "screen_full"]
@@ -360,6 +375,30 @@ def _fill_coverage_gaps(
     wait=wait_fixed(1),
     reraise=True,
 )
+def analyze_dead_zone_cues(
+    words: list[dict[str, Any]],
+) -> DeadZoneCuesResponse:
+    """LLM flags narrator-signaled skippable spans ("while installs", ...).
+
+    Emits DeadZoneCue entries with a confidence flag. Low-confidence
+    cues are intended to be verified downstream by a frame-inspection
+    stage (`src/stages/verify_cuts.py`) before any content is cut.
+
+    Retries up to config.LLM_MAX_RETRIES on schema validation failure.
+    """
+    raw = call_llm_json(config.DEAD_ZONE_CUES_PROMPT, {"words": words})
+    try:
+        return DeadZoneCuesResponse(**raw)
+    except ValidationError as e:
+        log.warning("dead_zone_cues response failed schema: %s — retrying", e)
+        raise
+
+
+@retry(
+    stop=stop_after_attempt(config.LLM_MAX_RETRIES),
+    wait=wait_fixed(1),
+    reraise=True,
+)
 def analyze_zoom_hints(words: list[dict[str, Any]]) -> ZoomHintsResponse:
     """LLM identifies deictic zoom moments ("look at this", "notice", ...).
 
@@ -406,14 +445,18 @@ def analyze_layout(
 
 
 __all__ = [
+    "Confidence",
     "FillerCut",
     "FillerCutsResponse",
+    "DeadZoneCue",
+    "DeadZoneCuesResponse",
     "Layout",
     "LayoutSegment",
     "LayoutPlanResponse",
     "ZoomStrength",
     "ZoomHint",
     "ZoomHintsResponse",
+    "analyze_dead_zone_cues",
     "analyze_zoom_hints",
     "strip_thinking",
     "_maybe_prepend_sequential_thinking",

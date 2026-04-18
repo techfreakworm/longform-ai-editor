@@ -112,6 +112,24 @@ USE_SCROLL_ZOOM = os.getenv("USE_SCROLL_ZOOM", "").lower() in {"1", "true", "yes
 SCROLL_ZOOM_SAMPLE_RATE_HZ = _f("SCROLL_ZOOM_SAMPLE_RATE_HZ", 2.0)
 SCROLL_ZOOM_DIFF_THRESHOLD = _f("SCROLL_ZOOM_DIFF_THRESHOLD", 0.04)  # 4% of pixels
 
+# ----- Frame-based cut verification ------------------------------------
+# Opt-in post-LLM pass: when an LLM cue comes back with confidence="low",
+# sample N frames from the proposed cut range and ask a multimodal Claude
+# whether the span is truly removable. Cost scales with number of
+# low-confidence cues × frame count × Claude wall-clock, so it's
+# deliberately off by default.
+VERIFY_UNCERTAIN_CUTS = os.getenv("VERIFY_UNCERTAIN_CUTS", "").lower() in {"1", "true", "yes"}
+VERIFY_FRAME_SAMPLES = _i("VERIFY_FRAME_SAMPLES", 8)
+VERIFY_MIN_FRAME_GAP_SEC = _f("VERIFY_MIN_FRAME_GAP_SEC", 2.0)
+# Multimodal models only: "opus" or "sonnet" (alias resolved by claude CLI).
+VERIFY_MODEL = os.getenv("VERIFY_MODEL", "opus")
+# How many times to recurse into "trim" decisions before giving up and
+# applying the latest trim. 0 = never recurse.
+VERIFY_MAX_RECURSION = _i("VERIFY_MAX_RECURSION", 2)
+# Claude CLI effort for verify calls. Frame analysis doesn't need max;
+# "high" is the usual sweet spot.
+VERIFY_EFFORT = os.getenv("VERIFY_EFFORT", "high")
+
 # ----- Render ----------------------------------------------------------
 VIDEO_BITRATE = os.getenv("VIDEO_BITRATE", "12M")
 VIDEO_RES_W = _i("VIDEO_RES_W", 1920)
@@ -375,6 +393,75 @@ signals BORING or SKIPPABLE on-screen content. Cue phrases include:
   - "alright, so now" (restart marker after a long wait)
 Only return ranges where silence or inactivity on screen is expected.
 
+Confidence field (required):
+  - "high" — clear cue phrase AND a clear resume marker. You are sure the
+    full [start, end] range is removable. Example: narrator says "while
+    this installs" at t=120 and "okay, it's done" at t=148 — the 28 s
+    between is safely skippable.
+  - "low"  — the cue is suggestive but the extent of the skip is
+    ambiguous. Examples:
+      * "let me skip this" with no clear resume cue — might extend 5 s
+        or 5 min, you're guessing.
+      * narrator pauses for 40 s with no verbal cue at all — could be
+        dead air, could be deliberate reading time.
+      * a long "alright, so now" restart after silence — hard to tell
+        from transcript alone whether the preceding silence was
+        genuinely dead or the narrator was thinking out loud.
+    Emit the cue WITH confidence="low". A downstream verifier will
+    inspect actual frames from [start, end] and either accept, trim,
+    or reject the cut.
+
+Do NOT use "low" as a safety valve to flag everything. Reserve it for
+cues where visual frame evidence would genuinely change your answer.
+Expect ≤ 20% of emitted cues to be "low" on typical footage.
+
 Return strict JSON:
-{"cues": [{"start": 120.5, "end": 148.3, "reason": "while installs"}, ...]}
+{"cues": [
+  {"start": 120.5, "end": 148.3, "reason": "while installs",
+   "confidence": "high"},
+  {"start": 200.1, "end": 245.0, "reason": "let me skip this, no resume cue",
+   "confidence": "low"}
+]}
+"""
+
+
+VERIFY_CUT_PROMPT = """You are reviewing a proposed CUT in a tutorial video.
+An earlier pass flagged this span as potentially removable but was not
+confident. Decide whether to cut.
+
+You are given:
+  - reason: why the earlier pass considered cutting (e.g. "while installs
+    — no narration, screen may be static")
+  - kind: "dead_zone" (multi-second skippable span) or "filler" (sub-second
+    verbal tic)
+  - frames: N evenly-spaced screenshots from the span, each labeled with
+    its timestamp in seconds relative to the clip.
+
+Decide one of:
+  - "accept" — frames confirm the span is removable. Nothing of teaching
+    value happens across them. Cut the entire [start, end].
+  - "reject" — frames reveal meaningful content (new text appearing,
+    command output, UI changes, code being typed, the presenter
+    referring to something visual). Do NOT cut.
+  - "trim"   — only the head or the tail is removable; the meaningful
+    portion sits at the opposite edge. Emit a NARROWER [start, end] that
+    keeps the meaningful portion. Trim MUST be edge-aligned: either the
+    new start equals the original start (trim the tail) OR the new end
+    equals the original end (trim the head). If the meaningful content
+    sits in the MIDDLE of the window, choose "reject" — do not emit a
+    middle-excluding trim.
+
+Rules:
+  - If all frames are visually identical pairwise, prefer "accept".
+  - If any pair differs meaningfully (text appears, window changes,
+    progress bar completes), lean "reject" or "trim".
+  - Transient popups that appear in a SINGLE isolated frame are noise —
+    still "accept" if the surrounding frames are static.
+  - Err toward "reject" when in doubt. A bad cut is worse than a kept
+    dead zone.
+
+Return strict JSON:
+{"decision": "accept" | "reject" | "trim",
+ "start": <float>, "end": <float>,
+ "rationale": "<one short sentence>"}
 """

@@ -24,6 +24,7 @@ from src.stages.cursor_zoom import ZoomSegment
 from src.stages.unify_segments import (
     EPS,
     SCREEN_VISIBLE_LAYOUTS,
+    DeadZoneCueEntry,
     Segment,
     ZoomWindow,
     annotate_cursor_zooms,
@@ -31,6 +32,7 @@ from src.stages.unify_segments import (
     apply_dead_zones,
     compute_triple_intersection_cuts,
     load_cuts,
+    load_dead_zone_cues,
     load_dead_zones,
     load_face_absent,
     load_layout_plan,
@@ -40,6 +42,7 @@ from src.stages.unify_segments import (
     subtract_range,
     validate,
 )
+from src.stages.verify_cuts import VerifyOutput
 
 
 # --- helpers -----------------------------------------------------------
@@ -536,6 +539,242 @@ def test_run_produces_valid_output(tmp_path: Path) -> None:
     # The cut at (105, 110) must leave a gap in the screen_full range
     sf_ranges = [(s.start, s.end) for s in segs if s.layout == "screen_full"]
     assert sf_ranges == [(100, 105), (110, 130)]
+
+
+# --- load_dead_zone_cues ----------------------------------------------
+
+def test_load_dead_zone_cues_missing_file_returns_empty(tmp_path: Path) -> None:
+    assert load_dead_zone_cues(tmp_path / "nope.json") == []
+
+
+def test_load_dead_zone_cues_preserves_confidence(tmp_path: Path) -> None:
+    path = tmp_path / "dead_zone_cues.json"
+    _write(path, {"cues": [
+        {"start": 10.0, "end": 120.0, "reason": "installs",
+         "confidence": "low"},
+        {"start": 200.0, "end": 205.0, "reason": "skip",
+         "confidence": "high"},
+    ]})
+    cues = load_dead_zone_cues(path)
+    assert len(cues) == 2
+    assert cues[0].confidence == "low"
+    assert cues[0].reason == "installs"
+    assert cues[1].confidence == "high"
+
+
+def test_load_dead_zone_cues_defaults_confidence_high_for_backward_compat(
+    tmp_path: Path,
+) -> None:
+    """Old artifacts without the field must still load."""
+    path = tmp_path / "dead_zone_cues.json"
+    _write(path, {"cues": [{"start": 10.0, "end": 20.0, "reason": "old"}]})
+    cues = load_dead_zone_cues(path)
+    assert cues[0].confidence == "high"
+
+
+def test_load_dead_zone_cues_malformed_json_returns_empty(tmp_path: Path) -> None:
+    path = tmp_path / "bad.json"
+    path.write_text("not json at all")
+    assert load_dead_zone_cues(path) == []
+
+
+# --- run() with dead-zone cues ---------------------------------------
+
+def test_run_applies_high_confidence_dead_zone_cues(tmp_path: Path) -> None:
+    """High-confidence cues always apply, regardless of VERIFY flag."""
+    _write(tmp_path / "layout_plan.json", {
+        "segments": [{"start": 0, "end": 300, "layout": "pip"}],
+    })
+    _write(tmp_path / "dead_zone_cues.json", {"cues": [
+        {"start": 100.0, "end": 180.0, "reason": "installs",
+         "confidence": "high"},
+    ]})
+    args = argparse.Namespace(
+        work=tmp_path, verbose=0, cursor=None,
+        screen_w=2560, screen_h=1440, origin_x=0.0, origin_y=0.0,
+    )
+    rc = run(args)
+    assert rc == 0
+    segs = json.loads((tmp_path / "segments.json").read_text())["segments"]
+    # Original 0–300 pip split by the cue cut into 0–100 + 180–300.
+    ranges = [(s["start"], s["end"]) for s in segs]
+    assert ranges == [(0.0, 100.0), (180.0, 300.0)]
+
+
+def test_run_skips_low_confidence_cues_when_verify_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With VERIFY_UNCERTAIN_CUTS off, low-confidence cues are ignored —
+    they do NOT cut, because we haven't verified them."""
+    monkeypatch.setattr("src.config.VERIFY_UNCERTAIN_CUTS", False)
+    _write(tmp_path / "layout_plan.json", {
+        "segments": [{"start": 0, "end": 300, "layout": "pip"}],
+    })
+    _write(tmp_path / "dead_zone_cues.json", {"cues": [
+        {"start": 100.0, "end": 180.0, "reason": "maybe",
+         "confidence": "low"},
+    ]})
+    args = argparse.Namespace(
+        work=tmp_path, verbose=0, cursor=None,
+        screen_w=2560, screen_h=1440, origin_x=0.0, origin_y=0.0,
+    )
+    rc = run(args)
+    assert rc == 0
+    segs = json.loads((tmp_path / "segments.json").read_text())["segments"]
+    # No cut applied — single segment 0–300.
+    assert len(segs) == 1
+    assert (segs[0]["start"], segs[0]["end"]) == (0.0, 300.0)
+
+
+def test_run_with_verifier_accept_applies_cut(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.config.VERIFY_UNCERTAIN_CUTS", True)
+    _write(tmp_path / "layout_plan.json", {
+        "segments": [{"start": 0, "end": 300, "layout": "pip"}],
+    })
+    _write(tmp_path / "dead_zone_cues.json", {"cues": [
+        {"start": 100.0, "end": 180.0, "reason": "install",
+         "confidence": "low"},
+    ]})
+    screen_path = tmp_path / "screen.mp4"
+    screen_path.write_bytes(b"x")
+
+    def fake_verify(candidates: list, *, screen_path: Path, work_dir: Path,
+                    **_kw: object) -> list[VerifyOutput]:
+        return [
+            VerifyOutput(
+                start=c.start, end=c.end, decision="accept",
+                rationale="frames identical",
+                original_start=c.start, original_end=c.end,
+                frame_timestamps=(c.start, c.end), recursion_depth=0,
+            ) for c in candidates
+        ]
+
+    monkeypatch.setattr("src.stages.unify_segments.verify_cuts_run", fake_verify)
+
+    args = argparse.Namespace(
+        work=tmp_path, verbose=0, cursor=None, screen=screen_path,
+        screen_w=2560, screen_h=1440, origin_x=0.0, origin_y=0.0,
+    )
+    rc = run(args)
+    assert rc == 0
+    segs = json.loads((tmp_path / "segments.json").read_text())["segments"]
+    ranges = [(s["start"], s["end"]) for s in segs]
+    assert ranges == [(0.0, 100.0), (180.0, 300.0)]
+
+
+def test_run_with_verifier_reject_keeps_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.config.VERIFY_UNCERTAIN_CUTS", True)
+    _write(tmp_path / "layout_plan.json", {
+        "segments": [{"start": 0, "end": 300, "layout": "pip"}],
+    })
+    _write(tmp_path / "dead_zone_cues.json", {"cues": [
+        {"start": 100.0, "end": 180.0, "reason": "fuzzy",
+         "confidence": "low"},
+    ]})
+    screen_path = tmp_path / "screen.mp4"
+    screen_path.write_bytes(b"x")
+
+    def fake_verify(candidates: list, **_kw: object) -> list[VerifyOutput]:
+        return [
+            VerifyOutput(
+                start=c.start, end=c.end, decision="reject",
+                rationale="code appears in frame 3",
+                original_start=c.start, original_end=c.end,
+                frame_timestamps=(c.start, c.end), recursion_depth=0,
+            ) for c in candidates
+        ]
+
+    monkeypatch.setattr("src.stages.unify_segments.verify_cuts_run", fake_verify)
+
+    args = argparse.Namespace(
+        work=tmp_path, verbose=0, cursor=None, screen=screen_path,
+        screen_w=2560, screen_h=1440, origin_x=0.0, origin_y=0.0,
+    )
+    rc = run(args)
+    assert rc == 0
+    segs = json.loads((tmp_path / "segments.json").read_text())["segments"]
+    # Cut rejected → single segment 0–300 survives.
+    assert len(segs) == 1
+    assert (segs[0]["start"], segs[0]["end"]) == (0.0, 300.0)
+
+
+def test_run_with_verifier_trim_applies_narrower_cut(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.config.VERIFY_UNCERTAIN_CUTS", True)
+    _write(tmp_path / "layout_plan.json", {
+        "segments": [{"start": 0, "end": 300, "layout": "pip"}],
+    })
+    _write(tmp_path / "dead_zone_cues.json", {"cues": [
+        {"start": 100.0, "end": 180.0, "reason": "partial",
+         "confidence": "low"},
+    ]})
+    screen_path = tmp_path / "screen.mp4"
+    screen_path.write_bytes(b"x")
+
+    def fake_verify(candidates: list, **_kw: object) -> list[VerifyOutput]:
+        # Trim tail — narrower cut is [100, 140], not the full [100, 180].
+        out = []
+        for c in candidates:
+            out.append(VerifyOutput(
+                start=c.start, end=140.0, decision="trim",
+                rationale="activity begins at t=140",
+                original_start=c.start, original_end=c.end,
+                frame_timestamps=(c.start, c.end), recursion_depth=0,
+            ))
+        return out
+
+    monkeypatch.setattr("src.stages.unify_segments.verify_cuts_run", fake_verify)
+
+    args = argparse.Namespace(
+        work=tmp_path, verbose=0, cursor=None, screen=screen_path,
+        screen_w=2560, screen_h=1440, origin_x=0.0, origin_y=0.0,
+    )
+    rc = run(args)
+    assert rc == 0
+    segs = json.loads((tmp_path / "segments.json").read_text())["segments"]
+    ranges = [(s["start"], s["end"]) for s in segs]
+    # Narrower cut [100, 140] — rest 140..300 preserved.
+    assert ranges == [(0.0, 100.0), (140.0, 300.0)]
+
+
+def test_run_verifier_skipped_without_screen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even with VERIFY_UNCERTAIN_CUTS=1, if no screen is available the
+    low-confidence cues fall back to the "skip" behavior — the verifier
+    has no frames to examine."""
+    monkeypatch.setattr("src.config.VERIFY_UNCERTAIN_CUTS", True)
+    _write(tmp_path / "layout_plan.json", {
+        "segments": [{"start": 0, "end": 300, "layout": "pip"}],
+    })
+    _write(tmp_path / "dead_zone_cues.json", {"cues": [
+        {"start": 100.0, "end": 180.0, "reason": "maybe",
+         "confidence": "low"},
+    ]})
+
+    calls: list[int] = []
+
+    def should_not_run(*_a: object, **_kw: object) -> list:
+        calls.append(1)
+        return []
+
+    monkeypatch.setattr("src.stages.unify_segments.verify_cuts_run",
+                        should_not_run)
+
+    args = argparse.Namespace(
+        work=tmp_path, verbose=0, cursor=None,  # no screen= attribute
+        screen_w=2560, screen_h=1440, origin_x=0.0, origin_y=0.0,
+    )
+    rc = run(args)
+    assert rc == 0
+    assert calls == []  # verifier never invoked
+    segs = json.loads((tmp_path / "segments.json").read_text())["segments"]
+    assert len(segs) == 1  # no cut applied
 
 
 # --- triple-intersection hard-cut ------------------------------------

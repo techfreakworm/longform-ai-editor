@@ -55,6 +55,8 @@ from src.stages.cursor_zoom import (
     zoom_segments_from_hints,
 )
 from src.stages.dead_zone_detect import intersect_intervals
+from src.stages.verify_cuts import VerifyInput
+from src.stages.verify_cuts import run as verify_cuts_run
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +66,14 @@ SCREEN_VISIBLE_LAYOUTS: frozenset[str] = frozenset({"pip", "screen_full"})
 
 # How closely two floats must agree to be "equal" for timeline ops.
 EPS = 1e-6
+
+
+@dataclass
+class DeadZoneCueEntry:
+    start: float
+    end: float
+    reason: str
+    confidence: Literal["high", "low"]
 
 
 @dataclass
@@ -134,6 +144,35 @@ def load_dead_zones(path: Path) -> list[tuple[float, float, str]]:
     return [(float(z["start"]), float(z["end"]), z["action"]) for z in zones]
 
 
+def load_dead_zone_cues(path: Path) -> list[DeadZoneCueEntry]:
+    """Load dead_zone_cues.json preserving the per-cue confidence.
+
+    Missing file or malformed JSON → empty list (no cues). Entries
+    without a `confidence` field default to "high" for backward
+    compatibility with artifacts written before the verifier shipped.
+    """
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return []
+    cues: list[DeadZoneCueEntry] = []
+    for c in data.get("cues", []) or []:
+        if "start" not in c or "end" not in c:
+            continue
+        conf = c.get("confidence", "high")
+        if conf not in ("high", "low"):
+            conf = "high"
+        cues.append(DeadZoneCueEntry(
+            start=float(c["start"]),
+            end=float(c["end"]),
+            reason=str(c.get("reason", "")),
+            confidence=conf,
+        ))
+    return cues
+
+
 def load_zoom_hints(path: Path) -> list[dict]:
     """Load zoom_hints.json from analyze stage (speech-emphasis zooms).
 
@@ -171,6 +210,51 @@ def load_silence_intervals(path: Path) -> list[tuple[float, float]]:
         return []
     data = json.loads(path.read_text())
     return [(float(x["start"]), float(x["end"])) for x in data.get("intervals", [])]
+
+
+def _resolve_dead_zone_cues(
+    cues: list[DeadZoneCueEntry],
+    *,
+    screen_path: Path | None,
+    work_dir: Path,
+) -> list[tuple[float, float]]:
+    """Turn dead-zone cues into (start, end) cuts.
+
+    High-confidence cues pass through. Low-confidence cues are:
+      - routed through the frame-based verifier when VERIFY_UNCERTAIN_CUTS
+        is set AND a screen recording is available,
+      - dropped otherwise (they stay as hints, not cuts) so we don't
+        delete content without evidence.
+    Verifier outputs with decision == "reject" are also dropped; "accept"
+    uses the original range; "trim" uses the narrower range.
+    """
+    if not cues:
+        return []
+    high = [c for c in cues if c.confidence == "high"]
+    low = [c for c in cues if c.confidence == "low"]
+    out: list[tuple[float, float]] = [(c.start, c.end) for c in high]
+
+    if low and config.VERIFY_UNCERTAIN_CUTS and screen_path is not None and screen_path.exists():
+        verify_inputs = [
+            VerifyInput(
+                start=c.start, end=c.end,
+                reason=c.reason, kind="dead_zone",
+            )
+            for c in low
+        ]
+        results = verify_cuts_run(
+            verify_inputs, screen_path=screen_path, work_dir=work_dir,
+        )
+        for r in results:
+            if r.decision in ("accept", "trim"):
+                out.append((r.start, r.end))
+        print(
+            f"[unify] verified {len(low)} low-conf cues: "
+            f"{sum(1 for r in results if r.decision == 'accept')} accept, "
+            f"{sum(1 for r in results if r.decision == 'trim')} trim, "
+            f"{sum(1 for r in results if r.decision == 'reject')} reject"
+        )
+    return out
 
 
 def compute_triple_intersection_cuts(
@@ -445,6 +529,7 @@ def run(args: argparse.Namespace) -> int:
     layout_path = work_dir / "layout_plan.json"
     filler_path = work_dir / "filler_cuts.json"
     dead_path = work_dir / "dead_zones.json"
+    dead_cues_path = work_dir / "dead_zone_cues.json"
     face_path = work_dir / "face_absent.json"
     silence_path = work_dir / "silence_intervals.json"
     sync_path = work_dir / "sync.json"
@@ -455,7 +540,12 @@ def run(args: argparse.Namespace) -> int:
         source_duration = timeline[-1].end
 
         filler_cuts = load_cuts(filler_path, key="cuts")
-        timeline = apply_cuts(timeline, filler_cuts)
+        cue_cuts = _resolve_dead_zone_cues(
+            load_dead_zone_cues(dead_cues_path),
+            screen_path=getattr(args, "screen", None),
+            work_dir=work_dir,
+        )
+        timeline = apply_cuts(timeline, filler_cuts + cue_cuts)
         timeline = merge_adjacent(timeline)
 
         # Triple-intersection hard-cut: face absent ∩ cursor idle ∩ narration silent.
@@ -620,10 +710,12 @@ def run(args: argparse.Namespace) -> int:
 __all__ = [
     "Layout",
     "SCREEN_VISIBLE_LAYOUTS",
+    "DeadZoneCueEntry",
     "ZoomWindow",
     "Segment",
     "load_layout_plan",
     "load_cuts",
+    "load_dead_zone_cues",
     "load_dead_zones",
     "load_face_absent",
     "load_silence_intervals",
@@ -636,4 +728,5 @@ __all__ = [
     "annotate_cursor_zooms",
     "validate",
     "run",
+    "verify_cuts_run",
 ]

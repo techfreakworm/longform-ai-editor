@@ -124,6 +124,7 @@ def run_analyze(args: argparse.Namespace) -> int:
     filler_path = work_dir / "filler_cuts.json"
     layout_path = work_dir / "layout_plan.json"
     zoom_hints_path = work_dir / "zoom_hints.json"
+    dead_cues_path = work_dir / "dead_zone_cues.json"
 
     try:
         # --- B.1 transcribe (with cache) ----------------------------
@@ -136,6 +137,7 @@ def run_analyze(args: argparse.Namespace) -> int:
         # --- B.2 LLM analysis ---------------------------------------
         # Imported lazily so CLI --help works without httpx/tenacity installed.
         from src.stages.analyze_llm import (
+            analyze_dead_zone_cues,
             analyze_fillers,
             analyze_layout,
             analyze_zoom_hints,
@@ -186,6 +188,27 @@ def run_analyze(args: argparse.Namespace) -> int:
             print(f"[analyze] zoom hints failed (non-fatal): {exc}", flush=True)
             # Write an empty hints file so downstream stages don't re-attempt.
             zoom_hints_path.write_text(json.dumps({"hints": []}, indent=2))
+
+        # Optional — dead-zone cues (narrator-signaled skippable spans).
+        # Low-confidence cues stay as hints until a frame verifier OKs
+        # them downstream; see src/stages/verify_cuts.py.
+        try:
+            print("[analyze] calling LLM for dead-zone cues", flush=True)
+            cues = analyze_dead_zone_cues(words)
+            dead_cues_path.write_text(json.dumps(
+                {"cues": [c.model_dump() for c in cues.cues]},
+                indent=2,
+            ))
+            n_low = sum(1 for c in cues.cues if c.confidence == "low")
+            print(
+                f"[analyze]   {len(cues.cues)} dead-zone cues "
+                f"({n_low} low-confidence) → {dead_cues_path}",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[analyze] dead-zone cues failed (non-fatal): {exc}",
+                  flush=True)
+            dead_cues_path.write_text(json.dumps({"cues": []}, indent=2))
         return 0
     except Exception as exc:  # noqa: BLE001
         print(f"[analyze] ERROR: {exc}", file=sys.stderr)
